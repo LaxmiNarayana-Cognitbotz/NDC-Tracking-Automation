@@ -3,13 +3,14 @@ OpenText Content Server - F&F (Full & Final) Exit Document Downloader
 """
 
 import asyncio
+import glob
 import os
 import re
 import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
@@ -77,13 +78,23 @@ HEADLESS = os.getenv("HEADLESS", "true").lower()
 ELEMENT_TIMEOUT = 15_000
 
 # Page load / navigation timeout (ms)
-NAV_TIMEOUT = 60_000
+NAV_TIMEOUT = 90_000
 
 # Maximum number of concurrent browser tabs for parallel downloads
-MAX_CONCURRENT_TABS = 10
+MAX_CONCURRENT_TABS = 5
 
 # How long to wait for the search results page to fully render (ms)
-SEARCH_RESULTS_WAIT = 10_000
+SEARCH_RESULTS_WAIT = 30_000
+
+# ── Result Status Constants ──────────────────────────────────────────────────
+# Used to distinguish different outcomes per employee so the summary is clear.
+STATUS_DOWNLOADED = "DOWNLOADED"          # F&F sheet found and saved
+STATUS_NO_FF_DOCS = "NO_FF_DOCS"          # Folder found, but no F&F sheet uploaded
+STATUS_NOT_FOUND  = "NOT_FOUND_0_HITS"    # Content Server returned 0 search results
+STATUS_ERROR      = "ERROR"               # Search timeout, network failure, etc.
+
+# Error screenshot directory
+ERROR_SCREENSHOT_DIR = Path(__file__).parent.parent / "errors" / "ff_error"
 
 
 def ts():
@@ -104,17 +115,125 @@ def _cleanup_profile_locks():
             pass
 
 
-async def save_debug_screenshot(page, label: str) -> str:
+def cleanup_error_screenshots(employee_number: str):
+    """Delete all debug error screenshots for the given employee from errors/ff_error/."""
+    if not ERROR_SCREENSHOT_DIR.exists():
+        return
+    patterns = [
+        str(ERROR_SCREENSHOT_DIR / f"debug_*_{employee_number}.png"),
+        str(ERROR_SCREENSHOT_DIR / f"debug_error_{employee_number}_*.png"),
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                os.remove(path)
+                print(f"[{ts()}]   Cleaned up error screenshot: {Path(path).name}")
+            except OSError:
+                pass
+
+
+def _extract_employee_id_from_debug_screenshot(path: Path) -> Optional[str]:
+    """Extract employee ID from debug_{label}_{employee_id}.png screenshots."""
+    match = re.match(r"^debug_[a-z_]+_(\d+)$", path.stem, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    # Backward compatibility for older timestamped error screenshots.
+    match = re.match(r"^debug_error_(\d+)_\d+$", path.stem, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def _debug_screenshot_path(label: str, employee_number: Optional[str] = None) -> Path:
+    safe_label = re.sub(r"[^A-Za-z_]+", "_", label).strip("_").lower()
+    if employee_number:
+        return ERROR_SCREENSHOT_DIR / f"debug_{safe_label}_{employee_number}.png"
+    return ERROR_SCREENSHOT_DIR / f"debug_{safe_label}.png"
+
+
+async def save_debug_screenshot(page, label: str, employee_number: Optional[str] = None) -> str:
     """Save a full-page screenshot for debugging."""
-    error_dir = Path(__file__).parent.parent / "errors" / "ff_error"
-    error_dir.mkdir(parents=True, exist_ok=True)
-    path = error_dir / f"debug_{label}_{datetime.now().strftime('%H%M%S')}.png"
+    ERROR_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    path = _debug_screenshot_path(label, employee_number)
     try:
         await page.screenshot(path=str(path), full_page=True)
         print(f"[{ts()}]   Screenshot: {path}")
     except Exception as e:
         print(f"[{ts()}]   Could not save screenshot: {e}")
     return str(path)
+
+
+def get_failed_ids_from_error_folder() -> List[str]:
+    """
+    Scan errors/ff_error/ for debug screenshots and extract unique
+    employee IDs from the filenames.
+
+    Filename pattern: debug_{label}_{employee_id}.png
+    Example: debug_error_30087487.png  ->  "30087487"
+    """
+    if not ERROR_SCREENSHOT_DIR.exists():
+        return []
+    seen = set()
+    ids = []
+    for path in ERROR_SCREENSHOT_DIR.glob("debug_*.png"):
+        emp_id = _extract_employee_id_from_debug_screenshot(path)
+        if emp_id and emp_id not in seen:
+            seen.add(emp_id)
+            ids.append(emp_id)
+    return ids
+
+
+async def check_and_dismiss_error_dialog(page) -> bool:
+    """
+    Detect and dismiss Content Server error dialogs (e.g. 'Network communication failed.').
+    Returns True if an error dialog was found and dismissed.
+    """
+    try:
+        # Look for common Content Server error modals
+        error_selectors = [
+            'div.binf-modal-dialog:has-text("Error")',
+            'div.binf-modal-content:has-text("Error")',
+            'div.csui-messagepanel:has-text("Error")',
+            'div.binf-modal-content:has-text("Network communication failed")',
+        ]
+        for sel in error_selectors:
+            try:
+                dialog = page.locator(sel).first
+                if await dialog.is_visible(timeout=1500):
+                    error_text = (await dialog.inner_text()).strip().replace("\n", " ")[:200]
+                    print(f"[{ts()}] [WARN] Content Server error dialog detected: {error_text}")
+
+                    # Try to click the Close button
+                    close_selectors = [
+                        'button:has-text("Close")',
+                        'button.binf-btn:has-text("Close")',
+                        'a.binf-close',
+                        'button.csui-btn-close',
+                        'button[aria-label="Close"]',
+                    ]
+                    for close_sel in close_selectors:
+                        try:
+                            close_btn = page.locator(close_sel).first
+                            if await close_btn.is_visible(timeout=2000):
+                                await close_btn.click(force=True)
+                                print(f"[{ts()}]   Dismissed error dialog")
+                                await page.wait_for_timeout(1500)
+                                return True
+                        except Exception:
+                            continue
+
+                    # If no Close button, press Escape
+                    await page.keyboard.press("Escape")
+                    print(f"[{ts()}]   Dismissed error dialog via Escape key")
+                    await page.wait_for_timeout(1500)
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
 
 
 # ── SSO Handling (ported from download_ndc_report.py) ────────────────────────
@@ -151,11 +270,11 @@ async def _handle_microsoft_sso(page):
     Automatically fill the Microsoft SSO login form dynamically.
     """
     if not ORACLE_EMAIL or not ORACLE_PASSWORD:
-        print(f"[{ts()}] ⚠ No credentials in .env — waiting for manual login...")
+        print(f"[{ts()}] [WARN] No credentials in .env -- waiting for manual login...")
         print(f"[{ts()}]   Create a .env file with ORACLE_EMAIL and ORACLE_PASSWORD")
         return False
 
-    print(f"[{ts()}] SSO login detected — filling credentials automatically...")
+    print(f"[{ts()}] SSO login detected -- filling credentials automatically...")
 
     # ── Dynamic SSO State Machine ─────────────────────────────────────────
     # Since Microsoft login screens can appear in unpredictable order (skipping
@@ -169,7 +288,7 @@ async def _handle_microsoft_sso(page):
         # 0. Check if we have been redirected away from Microsoft SSO
         current_url = page.url.lower()
         if not any(x in current_url for x in ["login.microsoftonline", "login.microsoft", "adfs", "saml"]):
-            print(f"[{ts()}]   SSO login completed — redirected away from login screen.")
+            print(f"[{ts()}]   SSO login completed -- redirected away from login screen.")
             return True
 
         # 1. "Pick an account" screen (check this first before touching inputs)
@@ -223,7 +342,7 @@ async def _handle_microsoft_sso(page):
                             use_another = page.locator('div#otherTile, div:has-text("Use another account")').last
                             if await use_another.is_visible(timeout=3000):
                                 await use_another.click(force=True, timeout=5000)
-                                print(f"[{ts()}]   Account not in list — clicked 'Use another account'")
+                                print(f"[{ts()}]   Account not in list -- clicked 'Use another account'")
                         except Exception:
                             print(f"[{ts()}]   Could not find matching account or 'Use another account' button")
 
@@ -398,9 +517,9 @@ async def wait_for_content_server_home(page, timeout_s: int = 300):
                 retry_btn = page.locator('button:has-text("Retry")').first
                 if await retry_btn.is_visible(timeout=1000):
                     rsa_retry_count += 1
-                    print(f"[{ts()}] ⚠ RSA/MFA Authentication failed or rejected (Attempt {rsa_retry_count}/3).")
+                    print(f"[{ts()}] [WARN] RSA/MFA Authentication failed or rejected (Attempt {rsa_retry_count}/3).")
                     if rsa_retry_count >= 3:
-                        await save_debug_screenshot(page, "rsa_failed_3_times")
+                        await save_debug_screenshot(page, "rsa_failed")
                         raise RuntimeError("RSA/MFA Authentication failed 3 times.")
 
                     print(f"[{ts()}]   Clicking 'Retry' for RSA...")
@@ -418,7 +537,7 @@ async def wait_for_content_server_home(page, timeout_s: int = 300):
             stay_signed = page.locator('#idSIButton9, input[value="Yes"]').first
             if await stay_signed.is_visible(timeout=1000):
                 await stay_signed.click()
-                print(f"[{ts()}]   Clicked 'Stay signed in? → Yes'")
+                print(f"[{ts()}]   Clicked 'Stay signed in? -> Yes'")
                 await page.wait_for_timeout(3000)
                 continue
         except Exception:
@@ -444,7 +563,7 @@ async def wait_for_content_server_home(page, timeout_s: int = 300):
 async def search_employee(page, employee_number: str):
     """
     Perform a search in Content Server for the given employee number.
-    Flow: Click search icon → type in search box → click search button.
+    Flow: Click search icon -> type in search box -> click search button.
     """
     print(f"[{ts()}] Searching for employee: {employee_number}")
 
@@ -502,15 +621,54 @@ async def search_employee(page, employee_number: str):
     )
     await page.wait_for_timeout(3000)
 
-    # Step 5: Wait for search results to appear
+    # Step 5: Wait for search results to appear (with smart "0 hits" detection)
+    # Check for error dialogs first (e.g. "Network communication failed")
+    if await check_and_dismiss_error_dialog(page):
+        print(f"[{ts()}]   Error dialog dismissed -- retrying search for {employee_number}")
+        await navigate_home(page)
+        await page.wait_for_timeout(2000)
+        # Retry the search once after dismissing the error
+        await search_employee(page, employee_number)
+        return
+
     try:
-        await page.locator("div.binf-list-group").first.wait_for(
+        # First, explicitly wait for the loading spinner to disappear
+        try:
+            spinner = page.locator(".csui-loading-parent-wrapper, .binf-list-group-loading, .load-container, .cs-indicator").first
+            await spinner.wait_for(state="hidden", timeout=SEARCH_RESULTS_WAIT)
+        except Exception:
+            pass
+
+        # Then wait for the results container to be visible (broader selectors)
+        await page.locator("#results, div.binf-list-group, .csui-search-results").first.wait_for(
             state="visible", timeout=SEARCH_RESULTS_WAIT
         )
     except PlaywrightTimeoutError:
-        await save_debug_screenshot(page, f"no_results_{employee_number}")
+        # Check if the search page shows "About 0 hits" -- meaning the employee
+        # genuinely doesn't exist on Content Server (not a timeout issue)
+        try:
+            zero_hits_loc = page.locator('text=/About 0 hits/i').first
+            if await zero_hits_loc.is_visible(timeout=2000):
+                print(f"[{ts()}]   Employee {employee_number} not found on Content Server (0 hits) -- skipping")
+                raise RuntimeError(
+                    f"Employee {employee_number} not found on Content Server (0 search results)"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        # Check for error dialog that appeared during search
+        if await check_and_dismiss_error_dialog(page):
+            print(f"[{ts()}]   Error dialog appeared during search -- skipping {employee_number}")
+            raise RuntimeError(
+                f"Content Server error during search for employee {employee_number}"
+            )
+
+        # Genuine timeout -- the server is too slow
+        await save_debug_screenshot(page, "no_results", employee_number)
         raise RuntimeError(
-            f"Search results did not appear for employee {employee_number}"
+            f"Search results did not appear for employee {employee_number} (timeout)"
         )
 
 
@@ -518,8 +676,75 @@ async def click_employee_master_folder(page, employee_number: str):
     """
     Finds and clicks the employee's master folder in the search results.
     The folder's name should match the employee number exactly.
+
+    Includes a polling wait (up to 15s) to ensure search results have fully
+    rendered in the DOM before checking -- this avoids false negatives caused
+    by concurrent tab searches overwhelming Content Server.
     """
-    # Define selectors for the search result title links
+    print(f"[{ts()}] Looking for exact master folder match: {employee_number}")
+
+    # ── Polling wait: ensure search results are actually rendered ──────────
+    # When multiple tabs search simultaneously, the DOM may not have rendered
+    # results yet even though the page looks ready. Poll up to 15s.
+    for _poll in range(6):  # 6 x 2.5s = 15s max
+        # Check for "0 hits" early to avoid waiting the full timeout
+        try:
+            zero_hits_loc = page.locator('text=/About 0 hits/i').first
+            if await zero_hits_loc.is_visible(timeout=500):
+                raise RuntimeError(
+                    f"Employee {employee_number} not found on Content Server (0 search results)"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
+        # Check if any search result link matching the employee number exists
+        try:
+            loc = page.get_by_role("link", name=employee_number, exact=True).first
+            if await loc.is_visible(timeout=500):
+                break  # Results are rendered, proceed to click
+        except Exception:
+            pass
+
+        # Also check title attribute
+        try:
+            loc = page.locator(f'a[title="{employee_number}"]').first
+            if await loc.is_visible(timeout=500):
+                break
+        except Exception:
+            pass
+
+        # Wait before next poll
+        await page.wait_for_timeout(2500)
+
+    # ── Strategy 1: Exact text matching using Playwright role locator ─────
+    try:
+        loc = page.get_by_role("link", name=employee_number, exact=True).first
+        if await loc.is_visible(timeout=5000):
+            await loc.scroll_into_view_if_needed()
+            await loc.click()
+            await page.wait_for_timeout(3000)
+            return
+    except Exception:
+        pass
+
+    # ── Strategy 2: Match by exact title / aria-label / data-binf-original-title
+    try:
+        loc = page.locator(
+            f'a[title="{employee_number}"], '
+            f'a[aria-label="{employee_number}"], '
+            f'a[data-binf-original-title="{employee_number}"]'
+        ).first
+        if await loc.is_visible(timeout=3000):
+            await loc.scroll_into_view_if_needed()
+            await loc.click()
+            await page.wait_for_timeout(3000)
+            return
+    except Exception:
+        pass
+
+    # ── Strategy 3: Iterate and check exact inner_text ────────────────────
     selectors = [
         ".csui-search-item a",
         "div.csui-search-item a",
@@ -534,45 +759,22 @@ async def click_employee_master_folder(page, employee_number: str):
             for i in range(count):
                 loc = locators.nth(i)
                 text = await loc.inner_text()
-                if text:
-                    cleaned_text = text.strip()
-                    # Check for exact match of the employee number
-                    if cleaned_text == employee_number:
-                        await loc.scroll_into_view_if_needed()
-                        await loc.click()
-                        await page.wait_for_timeout(3000)
-                        return
-        except Exception as e:
+                if text and text.strip() == employee_number:
+                    await loc.scroll_into_view_if_needed()
+                    await loc.click()
+                    await page.wait_for_timeout(3000)
+                    return
+        except Exception:
             pass
 
-    # Fallback: if we couldn't find an exact text match, let's try searching specifically for a folder
-    # matching the employee number, or fall back to the first search result.
-    print(f"[{ts()}] ⚠ Exact match not found. Trying fallback locator for text={employee_number}...")
-    try:
-        # Playwright exact text matching link
-        loc = page.get_by_role("link", name=employee_number, exact=True).first
-        if await loc.is_visible(timeout=5000):
-            await loc.click()
-            await page.wait_for_timeout(3000)
-            return
-    except Exception:
-        pass
-
-    # If all else fails, click the first search result (as in original script)
-    print(f"[{ts()}] ⚠ Could not find exact master folder match. Falling back to first search result.")
-    await click_with_fallback(
-        page,
-        [
-            "div.binf-list-group > div:nth-of-type(1) div.csui-search-item a",
-            'xpath=//*[@id="results"]/div[1]/div[1]/div/div/div[3]/div[1]/div[1]/div/div/a',
-        ],
-        "First search result (fallback)",
-        timeout_each=ELEMENT_TIMEOUT,
+    # Do NOT click the first search result -- it may belong to a different employee.
+    # This was causing the script to navigate into wrong folders and fail.
+    raise RuntimeError(
+        f"Employee folder '{employee_number}' not found in search results -- skipping"
     )
-    await page.wait_for_timeout(3000)
 
 
-async def click_adani_exit_documents(page):
+async def click_adani_exit_documents(page, employee_number: Optional[str] = None):
     """
     Click the 'Adani Exit Documents' folder link inside the employee folder.
     This navigates into the subfolder containing the F&F documents.
@@ -583,16 +785,31 @@ async def click_adani_exit_documents(page):
             state="visible", timeout=ELEMENT_TIMEOUT
         )
     except PlaywrightTimeoutError:
-        await save_debug_screenshot(page, "no_folder_table")
+        await save_debug_screenshot(page, "no_folder_table", employee_number)
         raise RuntimeError("Employee folder table did not load")
 
     await page.wait_for_timeout(1500)
 
-    # Click the "Adani Exit Documents" link
+    # Click the "Adani Exit Documents" link (exact match to avoid clicking files)
+    # First try exact role locator
+    try:
+        exact_folder = page.get_by_role("link", name="Adani Exit Documents", exact=True).first
+        if await exact_folder.is_visible(timeout=5000):
+            await exact_folder.scroll_into_view_if_needed()
+            await exact_folder.click()
+            await page.wait_for_timeout(3000)
+            return
+    except Exception:
+        pass
+
+    # Fallback to standard locators with exact matching priority
     await click_with_fallback(
         page,
         [
+            'a[title="Adani Exit Documents"]',
+            'a[aria-label="Adani Exit Documents"]',
             'text="Adani Exit Documents"',
+            'xpath=//a[text()="Adani Exit Documents"]',
             'a:has-text("Adani Exit Documents")',
             "tr.csui-state-hover > td.csui-table-cell-name a > span",
             'xpath=//span[contains(text(),"Adani Exit Documents")]',
@@ -647,11 +864,11 @@ def _is_ff_document(name: str) -> bool:
 
 
 async def download_document_at_row(
-    page, row_index: int, total_rows: int, download_dir: Path
+    page, row_index: int, total_rows: int, download_dir: Path, employee_number: str
 ) -> Optional[str]:
     """
     Download a single document from the folder table by its 1-based row index.
-    Flow: hover row → check if folder → check F&F name → click "More actions" → click "Download".
+    Flow: hover row -> check if folder -> check F&F name -> click "More actions" -> click "Download".
 
     Only downloads documents whose name matches the F&F regex pattern.
     The row_index is 1-based matching the <tr> nth-of-type in the DOM.
@@ -659,6 +876,13 @@ async def download_document_at_row(
     row_selector = f"tbody tr:nth-of-type({row_index})"
     try:
         row = page.locator(row_selector).first
+
+        # Try scrolling the row into view first to handle lazy-loaded or off-screen rows
+        try:
+            await row.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
+
         await row.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
 
         # Get the row name for logging
@@ -719,7 +943,7 @@ async def download_document_at_row(
                 print(f"[{ts()}]   Clicked 'More actions' via fallback")
         except Exception as e2:
             print(f"[{ts()}]   Could not click 'More actions' for row {row_index}: {e2}")
-            await save_debug_screenshot(page, f"more_actions_fail_row{row_index}")
+            await save_debug_screenshot(page, "more_actions_fail", employee_number)
             return None
 
     await page.wait_for_timeout(1500)
@@ -829,7 +1053,7 @@ async def download_document_at_row(
 
     except PlaywrightTimeoutError:
         print(f"[{ts()}]   Download timed out for row {row_index}")
-        await save_debug_screenshot(page, f"download_timeout_row{row_index}")
+        await save_debug_screenshot(page, "download_timeout", employee_number)
         return None
     except Exception as e:
         print(f"[{ts()}]   Error downloading row {row_index}: {e}")
@@ -854,7 +1078,7 @@ async def navigate_home(page):
 
 async def download_ff_for_employee(
     page, employee_number: str, download_dir: Path
-) -> List[str]:
+) -> Tuple[str, List[str]]:
     """
     Full flow to download all F&F documents for one employee:
       1. Search by employee number
@@ -862,10 +1086,16 @@ async def download_ff_for_employee(
       3. Click "Adani Exit Documents" folder
       4. Download each document
       5. Navigate back home
-    Returns a list of downloaded file paths.
+
+    Returns a tuple of (status, downloaded_file_paths):
+      - (STATUS_DOWNLOADED, [paths])  -- F&F files were found and saved.
+      - (STATUS_NO_FF_DOCS, [])       -- Folder found, but no F&F sheet uploaded.
+      - (STATUS_NOT_FOUND, [])        -- Content Server returned 0 search hits.
+      - (STATUS_ERROR, [])            -- Search timeout, network failure, etc.
     """
     downloaded_files = []
     emp_dir = None
+    status = STATUS_ERROR  # Default; overridden on success
 
     try:
         # Step 1: Search
@@ -875,41 +1105,71 @@ async def download_ff_for_employee(
         await click_employee_master_folder(page, employee_number)
 
         # Step 3: Navigate into "Adani Exit Documents"
-        await click_adani_exit_documents(page)
+        try:
+            await click_adani_exit_documents(page, employee_number)
+        except RuntimeError as e:
+            if "Employee folder table did not load" in str(e) or "Adani Exit Documents" in str(e):
+                print(f"[{ts()}] [WARN] Failed to load folder table or find Adani Exit Documents. Clicking Home and retrying once...")
+                await navigate_home(page)
+                await page.wait_for_timeout(3000)
+                await search_employee(page, employee_number)
+                await click_employee_master_folder(page, employee_number)
+                await click_adani_exit_documents(page, employee_number)
+            else:
+                raise
 
         # Step 4: Get document count and download each
         doc_count = await get_document_count(page)
 
         if doc_count == 0:
             print(f"[{ts()}]   No documents found for employee {employee_number}")
+            status = STATUS_NO_FF_DOCS
         else:
             # Define the subfolder path, but do NOT create it yet.
             # It will be created in download_document_at_row ONLY if a valid document is found.
             emp_dir = download_dir / employee_number
-            
+
             for row_idx in range(1, doc_count + 1):
+                # Check for error dialogs between downloads (server may show errors under load)
+                await check_and_dismiss_error_dialog(page)
+
                 result = await download_document_at_row(
-                    page, row_idx, doc_count, emp_dir
+                    page, row_idx, doc_count, emp_dir, employee_number
                 )
                 if result:
                     downloaded_files.append(result)
                 # Small delay between downloads
                 await page.wait_for_timeout(2000)
 
-        pass
+            # Folder was found and iterated -- set status based on whether any F&F file existed
+            if downloaded_files:
+                status = STATUS_DOWNLOADED
+            else:
+                # Documents existed (e.g. Resignation Letter, NDC Form) but none matched F&F
+                status = STATUS_NO_FF_DOCS
 
+    except RuntimeError as e:
+        err_msg = str(e)
+        if "0 search results" in err_msg or "0 hits" in err_msg:
+            print(f"[{ts()}] Employee {employee_number} not found on Content Server (0 hits)")
+            status = STATUS_NOT_FOUND
+        else:
+            print(f"[{ts()}] Error processing employee {employee_number}: {e}")
+            await save_debug_screenshot(page, "error", employee_number)
+            status = STATUS_ERROR
     except Exception as e:
         print(f"[{ts()}] Error processing employee {employee_number}: {e}")
-        await save_debug_screenshot(page, f"error_{employee_number}")
+        await save_debug_screenshot(page, "error", employee_number)
+        status = STATUS_ERROR
 
-    return downloaded_files
+    return status, downloaded_files
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def prompt_employee_numbers() -> List[str]:
     """
-    Interactive terminal prompt — collects employee ID(s) from the user on a single line.
+    Interactive terminal prompt -- collects employee ID(s) from the user on a single line.
     Strips any unwanted leading and trailing whitespaces.
     """
     # Use the raw terminal stream so the prompt is visible even with LoggerWriter
@@ -933,7 +1193,7 @@ def prompt_employee_numbers() -> List[str]:
     # Strip leading/trailing whitespaces from the whole input line
     raw = raw.strip()
     if not raw:
-        terminal.write("\n  → No employee numbers entered.\n\n")
+        terminal.write("\n  -> No employee numbers entered.\n\n")
         terminal.flush()
         return []
 
@@ -953,10 +1213,10 @@ def prompt_employee_numbers() -> List[str]:
             unique.append(num)
 
     if unique:
-        terminal.write(f"\n  → {len(unique)} employee(s) queued: {', '.join(unique)}\n\n")
+        terminal.write(f"\n  -> {len(unique)} employee(s) queued: {', '.join(unique)}\n\n")
         terminal.flush()
     else:
-        terminal.write("\n  → No employee numbers entered.\n\n")
+        terminal.write("\n  -> No employee numbers entered.\n\n")
         terminal.flush()
 
     return unique
@@ -966,16 +1226,19 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
     """
     Main entry point. Downloads F&F exit documents for one or more employees.
     Uses concurrent browser tabs (up to MAX_CONCURRENT_TABS) for parallel processing.
+    After the primary batch, automatically retries employees that had search/network
+    errors (STATUS_ERROR) with lower concurrency for reliability.
 
     Args:
         employee_numbers: List of employee numbers to process.
+        upload_callback:  Optional async callback(emp_num, file_list) for uploading.
     """
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     if not employee_numbers:
         print(f"[{ts()}] No employee numbers provided. Exiting.")
         return
-        
+
     if not CONTENT_SERVER_URL:
         print(f"[{ts()}] [FATAL ERROR] CONTENT_SERVER_URL is completely blank in your .env file!")
         print(f"[{ts()}] Please open the .env file and add the URL like: CONTENT_SERVER_URL=https://...")
@@ -987,12 +1250,106 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
 
     _cleanup_profile_locks()
 
-    all_results: dict[str, List[str]] = {}
+    # Structured results: emp_num -> (status, [file_paths])
+    all_results: Dict[str, Tuple[str, List[str]]] = {}
+
+    async def _run_batch(
+        p_context, emp_list: List[str], num_tabs: int,
+        nav_lock: asyncio.Lock, total_label: int, start_offset: int = 0,
+        upload_cb=None,
+    ):
+        """
+        Process a list of employees using the given browser context and tab count.
+        Updates all_results in-place.
+        """
+        # Pre-create worker tabs (reuse first page for tab 1)
+        first_page = p_context.pages[0] if p_context.pages else await p_context.new_page()
+        worker_pages = [first_page]
+        for i in range(1, num_tabs):
+            try:
+                new_tab = await p_context.new_page()
+                worker_pages.append(new_tab)
+                print(f"[{ts()}]   Opened tab {i + 1}/{num_tabs}")
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                print(f"[{ts()}]   Could not open tab {i + 1}: {e}")
+                break
+
+        actual_tabs = len(worker_pages)
+        print(f"[{ts()}] {actual_tabs} tab(s) ready. Starting downloads...\n")
+
+        async def _worker(worker_page, emp_num: str, idx: int):
+            """Process a single employee in its own browser tab."""
+            try:
+                print(f"[{ts()}] ── [Tab] Employee {idx}/{total_label}: {emp_num} ──")
+
+                # Navigate to Content Server home (serialised via lock)
+                nav_success = False
+                for nav_attempt in range(2):
+                    try:
+                        async with nav_lock:
+                            await worker_page.goto(
+                                CONTENT_SERVER_URL,
+                                wait_until="domcontentloaded",
+                                timeout=NAV_TIMEOUT,
+                            )
+                            await worker_page.wait_for_timeout(2000)
+                            await wait_for_content_server_home(worker_page, timeout_s=30)
+                        nav_success = True
+                        break
+                    except Exception as nav_err:
+                        if nav_attempt == 0:
+                            print(f"[{ts()}]   [Tab] Navigation timeout for {emp_num} -- retrying once...")
+                            await worker_page.wait_for_timeout(3000)
+                        else:
+                            raise RuntimeError(
+                                f"Content Server navigation failed after 2 attempts for {emp_num}: {nav_err}"
+                            )
+
+                if not nav_success:
+                    raise RuntimeError(f"Could not navigate to Content Server for {emp_num}")
+
+                # Download F&F docs for this employee
+                status, downloaded = await download_ff_for_employee(
+                    worker_page, emp_num, DOWNLOAD_DIR
+                )
+                all_results[emp_num] = (status, downloaded)
+
+                if downloaded and upload_cb:
+                    try:
+                        print(f"[{ts()}] [Tab] Triggering upload for {emp_num}...")
+                        await upload_cb(emp_num, downloaded)
+                    except Exception as e:
+                        print(f"[{ts()}] [Tab] Upload callback failed for {emp_num}: {e}")
+
+            except Exception as e:
+                print(f"[{ts()}] [Tab] Error for {emp_num}: {e}")
+                all_results[emp_num] = (STATUS_ERROR, [])
+
+        # Process employees in batches matching available tabs
+        for batch_start in range(0, len(emp_list), actual_tabs):
+            batch = emp_list[batch_start : batch_start + actual_tabs]
+            batch_tasks = []
+            for i, emp_num in enumerate(batch):
+                page = worker_pages[i]
+                idx = start_offset + batch_start + i + 1
+                batch_tasks.append(_worker(page, emp_num, idx))
+
+            await asyncio.gather(*batch_tasks)
+
+            # Small staggered delay between batches to avoid overwhelming Content Server
+            await asyncio.sleep(1.5)
+
+        # Close extra tabs (keep first page for potential retry reuse)
+        for wp in worker_pages[1:]:
+            try:
+                await wp.close()
+            except Exception:
+                pass
 
     try:
         async with async_playwright() as p:
             print(f"[{ts()}] Launching browser...")
-            # Build Chrome arguments
             chrome_args = [
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -1012,7 +1369,7 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
                 args=chrome_args,
             )
 
-            # ── Step 1: Use the first tab to establish login / SSO ────────
+            # ── Step 1: Establish login / SSO on the first tab ────────────
             first_page = context.pages[0] if context.pages else await context.new_page()
 
             print(f"[{ts()}] Navigating to Content Server...")
@@ -1021,97 +1378,140 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
             )
             await first_page.wait_for_timeout(3000)
 
-            # Wait for the page to load (handles SSO login if needed)
             await wait_for_content_server_home(first_page, timeout_s=120)
             await first_page.wait_for_timeout(2000)
             print(f"[{ts()}] Login confirmed. Preparing {concurrency} tab(s)...\n")
 
-            # ── Step 2: Pre-create all tabs sequentially ──────────────────
-            # Chrome cannot handle multiple simultaneous Target.createTarget
-            # calls, so we open tabs one-at-a-time before running work.
-            worker_pages = [first_page]  # Reuse first page for worker 1
-            for i in range(1, concurrency):
-                try:
-                    new_tab = await context.new_page()
-                    worker_pages.append(new_tab)
-                    print(f"[{ts()}]   Opened tab {i + 1}/{concurrency}")
-                    await asyncio.sleep(0.5)  # Small delay between tab creation
-                except Exception as e:
-                    print(f"[{ts()}]   Could not open tab {i + 1}: {e}")
+            nav_lock = asyncio.Lock()
+
+            # ── Step 2: Primary batch ─────────────────────────────────────
+            await _run_batch(
+                context, employee_numbers, concurrency,
+                nav_lock, len(employee_numbers),
+                upload_cb=upload_callback,
+            )
+
+            # -- Step 3: Retry loop -- keep retrying until errors/ff_error/ is empty --
+            # Scans the error screenshot folder for employee IDs and retries them.
+            # This also picks up leftover screenshots from previous runs.
+            MAX_RETRY_ROUNDS = 3
+            for retry_round in range(1, MAX_RETRY_ROUNDS + 1):
+                # Scan the error folder for remaining failed IDs
+                folder_failed_ids = get_failed_ids_from_error_folder()
+                if not folder_failed_ids:
+                    print(f"[{ts()}] errors/ff_error/ is empty -- no retries needed.")
                     break
 
-            actual_concurrency = len(worker_pages)
-            print(f"[{ts()}] {actual_concurrency} tab(s) ready. Starting downloads...\n")
+                retry_concurrency = min(2, len(folder_failed_ids))  # Lower concurrency for stability
+                print()
+                print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
+                print(f"[{ts()}] RETRY ROUND {retry_round}/{MAX_RETRY_ROUNDS}: {len(folder_failed_ids)} error screenshot(s) found")
+                print(f"[{ts()}]   IDs: {', '.join(folder_failed_ids)}")
+                print(f"[{ts()}]   Retrying with {retry_concurrency} tab(s) for reliability...")
+                print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
+                print()
 
-            # ── Step 3: Worker coroutine for one employee ─────────────────
-            async def _worker(worker_page, emp_num: str, idx: int):
-                """Process a single employee in its own (pre-created) browser tab."""
+                # Navigate first page back home before retry
                 try:
-                    print(f"[{ts()}] ── [Tab] Employee {idx}/{len(employee_numbers)}: {emp_num} ──")
-
-                    # Navigate this tab to Content Server home
-                    await worker_page.goto(
-                        CONTENT_SERVER_URL,
-                        wait_until="domcontentloaded",
-                        timeout=NAV_TIMEOUT,
-                    )
-                    await worker_page.wait_for_timeout(2000)
-                    await wait_for_content_server_home(worker_page, timeout_s=30)
-
-                    # Download F&F docs for this employee
-                    downloaded = await download_ff_for_employee(
-                        worker_page, emp_num, DOWNLOAD_DIR
-                    )
-                    all_results[emp_num] = downloaded
-                    
-                    if downloaded and upload_callback:
-                        try:
-                            print(f"[{ts()}] [Tab] Triggering upload for {emp_num}...")
-                            await upload_callback(emp_num, downloaded)
-                        except Exception as e:
-                            print(f"[{ts()}] [Tab] Upload callback failed for {emp_num}: {e}")
-                            
-                except Exception as e:
-                    print(f"[{ts()}] [Tab] Error for {emp_num}: {e}")
-                    all_results[emp_num] = []
-
-            # ── Step 4: Process employees in batches ──────────────────────
-            # Split employee list into batches matching available tabs.
-            # Each batch runs concurrently; batches run sequentially.
-            for batch_start in range(0, len(employee_numbers), actual_concurrency):
-                batch = employee_numbers[batch_start : batch_start + actual_concurrency]
-                batch_tasks = []
-                for i, emp_num in enumerate(batch):
-                    page = worker_pages[i]
-                    idx = batch_start + i + 1
-                    batch_tasks.append(_worker(page, emp_num, idx))
-
-                await asyncio.gather(*batch_tasks)
-
-            # Close all tabs
-            for wp in worker_pages:
-                try:
-                    await wp.close()
+                    remaining_pages = context.pages
+                    if remaining_pages:
+                        retry_page = remaining_pages[0]
+                        await retry_page.goto(
+                            CONTENT_SERVER_URL, wait_until="domcontentloaded", timeout=NAV_TIMEOUT
+                        )
+                        await retry_page.wait_for_timeout(2000)
+                        await wait_for_content_server_home(retry_page, timeout_s=30)
                 except Exception:
                     pass
 
-            await context.close()
+                await _run_batch(
+                    context, folder_failed_ids, retry_concurrency,
+                    nav_lock, len(folder_failed_ids),
+                    upload_cb=upload_callback,
+                )
+
+                # Clean up error screenshots for employees that succeeded on retry
+                resolved_count = 0
+                for emp_num in folder_failed_ids:
+                    retry_status, _ = all_results.get(emp_num, (STATUS_ERROR, []))
+                    if retry_status != STATUS_ERROR:
+                        print(f"[{ts()}]   [OK] {emp_num} resolved on retry (status: {retry_status})")
+                        cleanup_error_screenshots(emp_num)
+                        resolved_count += 1
+
+                print(f"[{ts()}]   Round {retry_round} complete: {resolved_count}/{len(folder_failed_ids)} resolved")
+
+                # Check if error folder is now empty
+                remaining = get_failed_ids_from_error_folder()
+                if not remaining:
+                    print(f"[{ts()}] errors/ff_error/ is now empty -- all retries succeeded!")
+                    break
+                elif retry_round < MAX_RETRY_ROUNDS:
+                    print(f"[{ts()}]   {len(remaining)} still remaining, will retry next round...")
+                else:
+                    print(f"[{ts()}]   {len(remaining)} still remaining after {MAX_RETRY_ROUNDS} retry rounds.")
+
+            # ── Close browser ─────────────────────────────────────────────
+            for pg in context.pages:
+                try:
+                    await pg.close()
+                except Exception:
+                    pass
+            try:
+                await context.close()
+            except Exception:
+                pass
 
     except Exception as e:
         print(f"[{ts()}] FATAL: {e}\n{traceback.format_exc()}")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
+    # ── Categorized Summary ───────────────────────────────────────────────────
+    _print_categorized_summary(all_results)
+
+
+def _print_categorized_summary(all_results: Dict[str, Tuple[str, List[str]]]):
+    """Print a clear, categorized download summary."""
+    downloaded = {k: v for k, (s, v) in all_results.items() if s == STATUS_DOWNLOADED}
+    no_ff      = {k: v for k, (s, v) in all_results.items() if s == STATUS_NO_FF_DOCS}
+    not_found  = {k: v for k, (s, v) in all_results.items() if s == STATUS_NOT_FOUND}
+    errors     = {k: v for k, (s, v) in all_results.items() if s == STATUS_ERROR}
+
+    total_files = sum(len(v) for v in downloaded.values())
+    total_emps  = len(all_results)
+
     print()
     print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
     print(f"[{ts()}] DOWNLOAD SUMMARY")
     print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
-    total_files = 0
-    for emp_num, files in all_results.items():
-        status = f"{len(files)} file(s)" if files else "FAILED / No documents"
-        print(f"[{ts()}]   {emp_num}: {status}")
-        total_files += len(files)
+
+    if downloaded:
+        print(f"[{ts()}]")
+        print(f"[{ts()}]   [OK] DOWNLOADED ({len(downloaded)} employee(s), {total_files} file(s)):")
+        for emp, files in downloaded.items():
+            print(f"[{ts()}]      {emp}: {len(files)} file(s)")
+
+    if no_ff:
+        print(f"[{ts()}]")
+        print(f"[{ts()}]   [INFO] NO F&F DOCUMENT ({len(no_ff)} employee(s) -- folder found, no F&F sheet uploaded):")
+        for emp in no_ff:
+            print(f"[{ts()}]      {emp}")
+
+    if not_found:
+        print(f"[{ts()}]")
+        print(f"[{ts()}]   [--] NOT FOUND ON CONTENT SERVER ({len(not_found)} employee(s) -- 0 search hits):")
+        for emp in not_found:
+            print(f"[{ts()}]      {emp}")
+
+    if errors:
+        print(f"[{ts()}]")
+        print(f"[{ts()}]   [FAIL] FAILED / ERRORS ({len(errors)} employee(s) -- search timeout or network failure):")
+        for emp in errors:
+            print(f"[{ts()}]      {emp}")
+
     print(f"[{ts()}] ───────────────────────────────────────────────────────────")
-    print(f"[{ts()}]   Total: {total_files} file(s) downloaded for {len(all_results)} employee(s)")
+    print(f"[{ts()}]   Total: {total_files} file(s) downloaded for {total_emps} employee(s)")
+    if errors:
+        print(f"[{ts()}]   [WARN] {len(errors)} employee(s) still have unresolved errors -- check errors/ff_error/ for screenshots")
     print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
 
 

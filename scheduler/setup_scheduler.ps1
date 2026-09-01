@@ -10,8 +10,8 @@ $PYTHONW  = Join-Path $ROOT ".venv\Scripts\pythonw.exe"
 $NDC_SCRIPT = Join-Path $ROOT "scheduler\run_pipeline.py"
 $FNF_SCRIPT = Join-Path $ROOT "scripts\process_fnf_closed_reports.py"
 
-$ndcTaskNames = @("NDC_Pipeline_1000", "NDC_Pipeline_1400", "NDC_Pipeline_1800")
-$fnfTaskNames = @("FNF_Pipeline_1115", "FNF_Pipeline_1630")
+$ndcTaskNames = @("NDC_Pipeline_1000", "NDC_Pipeline_1400")
+$fnfTaskNames = @("FNF_Pipeline_1430")
 $allTaskNames = $ndcTaskNames + $fnfTaskNames
 
 # Helper function to dynamically uninstall tasks matching a pattern
@@ -112,13 +112,11 @@ $fnfAction = New-ScheduledTaskAction `
 
 $ndcTasks = @(
     @{ Name = "NDC_Pipeline_1000"; Time = "10:00" },
-    @{ Name = "NDC_Pipeline_1400"; Time = "14:00" },
-    @{ Name = "NDC_Pipeline_1800"; Time = "18:00" }
+    @{ Name = "NDC_Pipeline_1400"; Time = "14:00" }
 )
 
 $fnfTasks = @(
-    @{ Name = "FNF_Pipeline_1115"; Time = "11:15" },
-    @{ Name = "FNF_Pipeline_1630"; Time = "16:30" }
+    @{ Name = "FNF_Pipeline_1430"; Time = "14:30" }
 )
 
 # ── Register tasks ────────────────────────────────────────────────────────────
@@ -166,8 +164,8 @@ if ($failed -eq 0) {
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host "  SUCCESS! All tasks registered." -ForegroundColor Green
     Write-Host ""
-    Write-Host "  NDC Runs silently at: 10:00 | 14:00 | 18:00" -ForegroundColor Green
-    Write-Host "  F&F Runs silently at: 11:15 | 16:30" -ForegroundColor Green
+    Write-Host "  NDC Runs silently at: 10:00 | 13:00 | 16:00 | 19:00" -ForegroundColor Green
+    Write-Host "  F&F Runs silently at: 14:30" -ForegroundColor Green
     Write-Host "  Missed triggers fire automatically on next boot/wake." -ForegroundColor Green
     Write-Host ""
     Write-Host "  Commands:" -ForegroundColor Gray

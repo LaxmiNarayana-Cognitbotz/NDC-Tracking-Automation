@@ -80,6 +80,21 @@ uv run scripts/process_fnf_closed_reports.py
 
 # Run F&F Document Downloader manually for specific employee IDs
 uv run scripts/download_f&f_report.py
+
+# Run Pre-Joining & Talent Acquisition Document Downloader manually
+uv run scripts/download_prejoining_report.py
+
+# Upload ONLY NDC reports to SharePoint (skipping other folders)
+uv run scripts/upload_to_sharepoint.py --type ndc
+
+# Upload ONLY F&F documents to SharePoint
+uv run scripts/upload_to_sharepoint.py --type ff
+
+# Upload ONLY Pre-Joining documents to SharePoint
+uv run scripts/upload_to_sharepoint.py --type prejoining
+
+# Upload a specific file directly to SharePoint
+uv run scripts/upload_to_sharepoint.py --file "C:\path\to\your\file.pdf"
 ```
 
 ---

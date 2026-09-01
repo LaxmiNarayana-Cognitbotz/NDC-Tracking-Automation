@@ -84,7 +84,7 @@ NAV_TIMEOUT = 90_000
 MAX_CONCURRENT_TABS = 5
 
 # How long to wait for the search results page to fully render (ms)
-SEARCH_RESULTS_WAIT = 30_000
+SEARCH_RESULTS_WAIT = 45_000
 
 # ── Result Status Constants ──────────────────────────────────────────────────
 # Used to distinguish different outcomes per employee so the summary is clear.
@@ -606,28 +606,28 @@ async def search_employee(page, employee_number: str):
     await search_input.fill("")
     await page.wait_for_timeout(300)
     await search_input.fill(employee_number)
+    await page.wait_for_timeout(300)
+
+    # Press Enter on the search input to trigger search
+    await search_input.press("Enter")
     await page.wait_for_timeout(500)
 
-    # Step 4: Click the Search submit button
-    await click_with_fallback(
-        page,
-        [
-            'a[title="Search in Content Server"]',
-            "div.csui-search a",
-            'xpath=/html/body/div[2]/nav/div/div[2]/div[2]/div/div[2]/a',
-        ],
-        "Search submit button",
-        timeout_each=ELEMENT_TIMEOUT,
-    )
-    await page.wait_for_timeout(3000)
+    # Also click the Search submit button as fallback
+    try:
+        search_btn = page.locator('a[title="Search in Content Server"], div.csui-search a').first
+        if await search_btn.is_visible(timeout=1500):
+            await search_btn.click()
+    except Exception:
+        pass
 
-    # Step 5: Wait for search results to appear (with smart "0 hits" detection)
-    # Check for error dialogs first (e.g. "Network communication failed")
+    # Give Content Server time to dispatch query and detach old DOM
+    await page.wait_for_timeout(3500)
+
+    # Step 5: Wait for search results to appear
     if await check_and_dismiss_error_dialog(page):
         print(f"[{ts()}]   Error dialog dismissed -- retrying search for {employee_number}")
         await navigate_home(page)
         await page.wait_for_timeout(2000)
-        # Retry the search once after dismissing the error
         await search_employee(page, employee_number)
         return
 
@@ -639,31 +639,32 @@ async def search_employee(page, employee_number: str):
         except Exception:
             pass
 
-        # Then wait for the results container to be visible (broader selectors)
+        # Then wait for the results container to be visible
         await page.locator("#results, div.binf-list-group, .csui-search-results").first.wait_for(
             state="visible", timeout=SEARCH_RESULTS_WAIT
         )
     except PlaywrightTimeoutError:
-        # Check if the search page shows "About 0 hits" -- meaning the employee
-        # genuinely doesn't exist on Content Server (not a timeout issue)
-        try:
-            zero_hits_loc = page.locator('text=/About 0 hits/i').first
-            if await zero_hits_loc.is_visible(timeout=2000):
-                print(f"[{ts()}]   Employee {employee_number} not found on Content Server (0 hits) -- skipping")
-                raise RuntimeError(
-                    f"Employee {employee_number} not found on Content Server (0 search results)"
-                )
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-
         # Check for error dialog that appeared during search
         if await check_and_dismiss_error_dialog(page):
             print(f"[{ts()}]   Error dialog appeared during search -- skipping {employee_number}")
             raise RuntimeError(
                 f"Content Server error during search for employee {employee_number}"
             )
+
+        # Check if the search page genuinely shows "About 0 hits"
+        try:
+            zero_hits_loc = page.locator('text=/About 0 hits/i').first
+            if await zero_hits_loc.is_visible(timeout=3000):
+                link_count = await page.locator(f'a:has-text("{employee_number}")').count()
+                if link_count == 0:
+                    print(f"[{ts()}]   Employee {employee_number} not found on Content Server (0 hits) -- skipping")
+                    raise RuntimeError(
+                        f"Employee {employee_number} not found on Content Server (0 search results)"
+                    )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
 
         # Genuine timeout -- the server is too slow
         await save_debug_screenshot(page, "no_results", employee_number)
@@ -684,36 +685,45 @@ async def click_employee_master_folder(page, employee_number: str):
     print(f"[{ts()}] Looking for exact master folder match: {employee_number}")
 
     # ── Polling wait: ensure search results are actually rendered ──────────
-    # When multiple tabs search simultaneously, the DOM may not have rendered
-    # results yet even though the page looks ready. Poll up to 15s.
-    for _poll in range(6):  # 6 x 2.5s = 15s max
-        # Check for "0 hits" early to avoid waiting the full timeout
-        try:
-            zero_hits_loc = page.locator('text=/About 0 hits/i').first
-            if await zero_hits_loc.is_visible(timeout=500):
-                raise RuntimeError(
-                    f"Employee {employee_number} not found on Content Server (0 search results)"
-                )
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-
-        # Check if any search result link matching the employee number exists
+    # Content Server takes time under concurrent tab load.
+    # We poll up to 8 times (8 x 2.5s = 20s) looking for the employee link.
+    # Crucially: We do NOT abort early on poll 0/1 for "0 hits" to avoid false negatives
+    # caused by leftover DOM text from a previous search!
+    for _poll in range(8):
+        # 1. First priority: Check if any link matching employee number exists
         try:
             loc = page.get_by_role("link", name=employee_number, exact=True).first
-            if await loc.is_visible(timeout=500):
+            if await loc.is_visible(timeout=1000):
                 break  # Results are rendered, proceed to click
         except Exception:
             pass
 
-        # Also check title attribute
+        # Also check title / aria-label attribute
         try:
-            loc = page.locator(f'a[title="{employee_number}"]').first
-            if await loc.is_visible(timeout=500):
+            loc = page.locator(
+                f'a[title="{employee_number}"], '
+                f'a[aria-label="{employee_number}"], '
+                f'a[data-binf-original-title="{employee_number}"]'
+            ).first
+            if await loc.is_visible(timeout=1000):
                 break
         except Exception:
             pass
+
+        # 2. Only after at least 3 polls (after 7+ seconds of waiting), check for genuine "0 hits"
+        if _poll >= 3:
+            try:
+                zero_hits_loc = page.locator('text=/About 0 hits/i').first
+                if await zero_hits_loc.is_visible(timeout=1000):
+                    has_link = await page.locator(f'a:has-text("{employee_number}")').count()
+                    if has_link == 0:
+                        raise RuntimeError(
+                            f"Employee {employee_number} not found on Content Server (0 search results)"
+                        )
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
 
         # Wait before next poll
         await page.wait_for_timeout(2500)
@@ -1148,11 +1158,14 @@ async def download_ff_for_employee(
                 # Documents existed (e.g. Resignation Letter, NDC Form) but none matched F&F
                 status = STATUS_NO_FF_DOCS
 
+        cleanup_error_screenshots(employee_number)
+
     except RuntimeError as e:
         err_msg = str(e)
         if "0 search results" in err_msg or "0 hits" in err_msg:
             print(f"[{ts()}] Employee {employee_number} not found on Content Server (0 hits)")
             status = STATUS_NOT_FOUND
+            cleanup_error_screenshots(employee_number)
         else:
             print(f"[{ts()}] Error processing employee {employee_number}: {e}")
             await save_debug_screenshot(page, "error", employee_number)
@@ -1324,6 +1337,7 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
 
             except Exception as e:
                 print(f"[{ts()}] [Tab] Error for {emp_num}: {e}")
+                await save_debug_screenshot(worker_page, "error", emp_num)
                 all_results[emp_num] = (STATUS_ERROR, [])
 
         # Process employees in batches matching available tabs
@@ -1392,21 +1406,35 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
             )
 
             # -- Step 3: Retry loop -- keep retrying until errors/ff_error/ is empty --
-            # Scans the error screenshot folder for employee IDs and retries them.
-            # This also picks up leftover screenshots from previous runs.
-            MAX_RETRY_ROUNDS = 3
+            # In Round 1, also retry any employees that received "0 hits" during the primary batch,
+            # ensuring that temporary Content Server lag does not produce false negatives.
+            MAX_RETRY_ROUNDS = 5
+            initial_not_found = [
+                emp for emp, (st, _) in all_results.items() if st == STATUS_NOT_FOUND
+            ]
+
             for retry_round in range(1, MAX_RETRY_ROUNDS + 1):
-                # Scan the error folder for remaining failed IDs
                 folder_failed_ids = get_failed_ids_from_error_folder()
-                if not folder_failed_ids:
+
+                # In Round 1, include initial 0-hits so they are given a stable retry with 2 tabs
+                if retry_round == 1 and initial_not_found:
+                    combined_ids = list(folder_failed_ids)
+                    for nf_id in initial_not_found:
+                        if nf_id not in combined_ids:
+                            combined_ids.append(nf_id)
+                    current_retry_ids = combined_ids
+                else:
+                    current_retry_ids = folder_failed_ids
+
+                if not current_retry_ids:
                     print(f"[{ts()}] errors/ff_error/ is empty -- no retries needed.")
                     break
 
-                retry_concurrency = min(2, len(folder_failed_ids))  # Lower concurrency for stability
+                retry_concurrency = min(2, len(current_retry_ids))  # Lower concurrency for stability
                 print()
                 print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
-                print(f"[{ts()}] RETRY ROUND {retry_round}/{MAX_RETRY_ROUNDS}: {len(folder_failed_ids)} error screenshot(s) found")
-                print(f"[{ts()}]   IDs: {', '.join(folder_failed_ids)}")
+                print(f"[{ts()}] RETRY ROUND {retry_round}/{MAX_RETRY_ROUNDS}: {len(current_retry_ids)} employee(s) queued for retry")
+                print(f"[{ts()}]   IDs: {', '.join(current_retry_ids)}")
                 print(f"[{ts()}]   Retrying with {retry_concurrency} tab(s) for reliability...")
                 print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
                 print()
@@ -1425,21 +1453,21 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
                     pass
 
                 await _run_batch(
-                    context, folder_failed_ids, retry_concurrency,
-                    nav_lock, len(folder_failed_ids),
+                    context, current_retry_ids, retry_concurrency,
+                    nav_lock, len(current_retry_ids),
                     upload_cb=upload_callback,
                 )
 
                 # Clean up error screenshots for employees that succeeded on retry
                 resolved_count = 0
-                for emp_num in folder_failed_ids:
+                for emp_num in current_retry_ids:
                     retry_status, _ = all_results.get(emp_num, (STATUS_ERROR, []))
                     if retry_status != STATUS_ERROR:
                         print(f"[{ts()}]   [OK] {emp_num} resolved on retry (status: {retry_status})")
                         cleanup_error_screenshots(emp_num)
                         resolved_count += 1
 
-                print(f"[{ts()}]   Round {retry_round} complete: {resolved_count}/{len(folder_failed_ids)} resolved")
+                print(f"[{ts()}]   Round {retry_round} complete: {resolved_count}/{len(current_retry_ids)} resolved")
 
                 # Check if error folder is now empty
                 remaining = get_failed_ids_from_error_folder()

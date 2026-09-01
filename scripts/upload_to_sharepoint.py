@@ -254,9 +254,18 @@ async def upload_file(client: httpx.AsyncClient, site_id: str, drive_id: str, ta
         if response.status_code not in [200, 201]:
             raise Exception(f"Upload failed (PUT): {response.status_code} - {response.text}")
     else:
-        # Create upload session for larger files
+        # Create upload session for larger files (explicitly replace to avoid _1 duplicates)
         session_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:/{encoded_path}:/createUploadSession"
-        session_response = await client.post(session_url, headers={"Authorization": f"Bearer {token}"})
+        session_payload = {
+            "item": {
+                "@microsoft.graph.conflictBehavior": "replace"
+            }
+        }
+        session_response = await client.post(
+            session_url,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=session_payload,
+        )
         if session_response.status_code != 200:
             raise Exception(f"Failed to create upload session: {session_response.status_code} - {session_response.text}")
         
@@ -272,6 +281,44 @@ async def upload_file(client: httpx.AsyncClient, site_id: str, drive_id: str, ta
             chunk_res = await client.put(upload_url, headers=chunk_headers, content=chunk)
             if chunk_res.status_code not in [200, 201, 202]:
                 raise Exception(f"Chunk upload failed (Session): {chunk_res.status_code} - {chunk_res.text}")
+
+
+async def cleanup_sharepoint_folder_files(client: httpx.AsyncClient, site_id: str, drive_id: str, folder_url: str):
+    """
+    Delete all existing files inside a specific SharePoint folder before uploading new ones.
+    Prevents duplicate files (_1, _2 suffixes) or retaining outdated documents.
+    """
+    try:
+        token = await get_access_token()
+        headers = {"Authorization": f"Bearer {token}"}
+        encoded_path = encode_path_segments(folder_url)
+
+        url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:/{encoded_path}:/children"
+        response = await client.get(url, headers=headers)
+
+        if response.status_code == 200:
+            children = response.json().get("value", [])
+            files = [item for item in children if "file" in item]
+            deleted_count = 0
+            for f in files:
+                item_id = f.get("id")
+                file_name = f.get("name", "unknown")
+                delete_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{item_id}"
+                del_res = await client.delete(delete_url, headers=headers)
+                if del_res.status_code in [200, 204]:
+                    deleted_count += 1
+                    print(f"[{ts()}]   [CLEANUP] Deleted existing SharePoint file: {file_name}")
+                else:
+                    print(f"[{ts()}]   [CLEANUP] Could not delete SharePoint file {file_name}: {del_res.text}")
+            if deleted_count > 0:
+                print(f"[{ts()}]   [CLEANUP] Cleared {deleted_count} existing file(s) from SharePoint folder: {folder_url}")
+        elif response.status_code == 404:
+            # Folder does not exist yet on SharePoint -- will be created on upload
+            pass
+        else:
+            print(f"[{ts()}]   [CLEANUP] Notice on folder query ({response.status_code}): {response.text}")
+    except Exception as e:
+        print(f"[{ts()}]   [CLEANUP] Error clearing SharePoint folder {folder_url}: {e}")
 
 
 def get_latest_report(directory: Path, pattern: str = "*.xls") -> Path:
@@ -318,36 +365,7 @@ async def upload_ndc_reports(client: httpx.AsyncClient, site_id: str, drive_id: 
     cleanup_old_ndc_reports(latest_file)
 
     target_folder_url = f"{target_base}/NDC_Reports"
-    
-    # Try to clean up existing files on SharePoint
-    try:
-        token = await get_access_token()
-        headers = {"Authorization": f"Bearer {token}"}
-        encoded_path = encode_path_segments(target_folder_url)
-        
-        url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:/{encoded_path}:/children"
-        response = await client.get(url, headers=headers)
-        
-        if response.status_code == 200:
-            children = response.json().get("value", [])
-            files = [item for item in children if "file" in item]
-            deleted_count = 0
-            for f in files:
-                item_id = f.get("id")
-                delete_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/items/{item_id}"
-                del_res = await client.delete(delete_url, headers=headers)
-                if del_res.status_code in [200, 204]:
-                    deleted_count += 1
-                else:
-                    print(f"[{ts()}] [CLEANUP] Could not delete SharePoint file {f.get('name')}: {del_res.text}")
-            if deleted_count > 0:
-                print(f"[{ts()}] [CLEANUP] Deleted {deleted_count} old files from SharePoint.")
-        elif response.status_code == 404:
-            print(f"[{ts()}] [CLEANUP] Target folder '{target_folder_url}' does not exist yet. It will be created during upload.")
-        else:
-            print(f"[{ts()}] [CLEANUP] SharePoint cleanup error: {response.status_code} - {response.text}")
-    except Exception as e:
-        print(f"[{ts()}] [CLEANUP] SharePoint cleanup error: {traceback.format_exc()}")
+    await cleanup_sharepoint_folder_files(client, site_id, drive_id, target_folder_url)
 
     print(f"[{ts()}] NDC report: {latest_file.name}")
     try:
@@ -369,7 +387,7 @@ async def upload_ff_reports(client: httpx.AsyncClient, site_id: str, drive_id: s
 
     target_base_url = f"{target_base}/F&F_Documents"
     print(f"[{ts()}] F&F documents: {len(subdirs)} employee(s)")
-    
+
     for subdir in subdirs:
         emp_id = subdir.name
         files = [f for f in subdir.iterdir() if f.is_file()]
@@ -377,6 +395,11 @@ async def upload_ff_reports(client: httpx.AsyncClient, site_id: str, drive_id: s
             continue
 
         emp_target_url = f"{target_base_url}/{emp_id}"
+
+        # 1. Delete all existing files in this employee's SharePoint folder first
+        await cleanup_sharepoint_folder_files(client, site_id, drive_id, emp_target_url)
+
+        # 2. Upload all documents for this employee from local system as-is
         for f in files:
             try:
                 await upload_file(client, site_id, drive_id, emp_target_url, f)

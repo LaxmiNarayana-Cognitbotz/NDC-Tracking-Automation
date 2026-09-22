@@ -43,6 +43,7 @@ Open `.env` in a text editor and fill in the required fields:
 * **Microsoft Azure App Registration** credentials (`SHAREPOINT_TENANT_ID`, `SHAREPOINT_CLIENT_ID`, `SHAREPOINT_CLIENT_SECRET`).
 * **SharePoint Destination Folder** path and site URL.
 * Set `HEADLESS=true` for background VM execution or `false` to open the browser window and watch.
+* Set `START_MAXIMIZED=true` (default) to launch the browser in full screen when `HEADLESS=false`.
 
 ### Step 2: Install Project Dependencies
 Run the following commands in your terminal to initialize the environment:

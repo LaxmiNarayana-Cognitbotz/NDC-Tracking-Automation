@@ -14,44 +14,17 @@ from typing import Optional, Tuple
 
 import httpx
 import msal
+import requests
+import urllib3
 from dotenv import load_dotenv
 
-# Redirect stdout and stderr to a log file
-LOG_DIR = Path(__file__).parent.parent / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "upload_to_sharepoint.log"
-
-class LoggerWriter:
-    def __init__(self, file_path):
-        self.terminal = sys.stdout
-        self.file_path = file_path
-
-    def write(self, message):
-        try:
-            with open(self.file_path, "a", encoding="utf-8") as f:
-                f.write(message)
-        except Exception:
-            pass
-        if self.terminal is not None:
-            try:
-                self.terminal.write(message)
-            except UnicodeEncodeError:
-                try:
-                    self.terminal.write(message.encode("cp1252", errors="replace").decode("cp1252"))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-    def flush(self):
-        if self.terminal is not None:
-            try:
-                self.terminal.flush()
-            except Exception:
-                pass
-
-sys.stdout = LoggerWriter(LOG_FILE)
-sys.stderr = LoggerWriter(LOG_FILE)
+from app.core.config import (
+    FF_REPORTS_DIR,
+    NDC_REPORTS_DIR,
+    PREJOINING_REPORTS_DIR,
+    UPLOADS_DIR,
+)
+from app.core.logger import setup_logger
 
 load_dotenv(verbose=True)
 
@@ -69,14 +42,6 @@ SCOPES = ["https://graph.microsoft.com/.default"]
 _SITE_ID: Optional[str] = None
 _DRIVE_ID: Optional[str] = None
 
-# Local Reports Directories
-UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
-NDC_REPORTS_DIR = UPLOADS_DIR / "NDC_Reports"
-FF_REPORTS_DIR = UPLOADS_DIR / "FF_Reports"
-
-# Ensure local directories exist
-NDC_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-FF_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 def ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -84,8 +49,6 @@ def ts():
 
 async def get_access_token() -> str:
     """Obtain a Microsoft Graph API access token using client credentials flow."""
-    import requests
-    import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
     session = requests.Session()
@@ -396,10 +359,10 @@ async def upload_ff_reports(client: httpx.AsyncClient, site_id: str, drive_id: s
 
         emp_target_url = f"{target_base_url}/{emp_id}"
 
-        # 1. Delete all existing files in this employee's SharePoint folder first
+        # ==== Delete all existing files in this employee SharePoint folder first ====
         await cleanup_sharepoint_folder_files(client, site_id, drive_id, emp_target_url)
 
-        # 2. Upload all documents for this employee from local system as-is
+        # ==== Upload all documents for this employee from local system as-is ====
         for f in files:
             try:
                 await upload_file(client, site_id, drive_id, emp_target_url, f)
@@ -408,13 +371,47 @@ async def upload_ff_reports(client: httpx.AsyncClient, site_id: str, drive_id: s
                 print(f"[{ts()}] [ERROR] Failed to upload {f.name} for employee {emp_id}: {e}\n{traceback.format_exc()}")
 
 
+async def upload_prejoining_reports(client: httpx.AsyncClient, site_id: str, drive_id: str, target_base: str):
+    """Upload Pre-Joining summary and employee document folders to SharePoint."""
+    if not PREJOINING_REPORTS_DIR.exists():
+        return
+
+    target_base_url = f"{target_base}/Pre_Joining_Reports"
+
+    # Upload Master Summary Excel if present
+    master_file = PREJOINING_REPORTS_DIR / "Master_Pre_Joining_Summary.xlsx"
+    if master_file.exists():
+        print(f"[{ts()}] Uploading Master Pre-Joining Summary to SharePoint...")
+        try:
+            await upload_file(client, site_id, drive_id, target_base_url, master_file)
+            print(f"[{ts()}] Uploaded successfully: {master_file.name}")
+        except Exception as e:
+            print(f"[{ts()}] [ERROR] Failed to upload {master_file.name}: {e}")
+
+    # Upload employee document folders
+    subdirs = [d for d in PREJOINING_REPORTS_DIR.iterdir() if d.is_dir()]
+    for subdir in subdirs:
+        emp_id = subdir.name
+        files = [f for f in subdir.iterdir() if f.is_file()]
+        if not files:
+            continue
+        emp_target_url = f"{target_base_url}/{emp_id}"
+        await cleanup_sharepoint_folder_files(client, site_id, drive_id, emp_target_url)
+        for f in files:
+            try:
+                await upload_file(client, site_id, drive_id, emp_target_url, f)
+                print(f"[{ts()}] Uploaded successfully: {f.name} for employee {emp_id}")
+            except Exception as e:
+                print(f"[{ts()}] [ERROR] Failed to upload {f.name} for employee {emp_id}: {e}")
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Upload report files to SharePoint.")
     parser.add_argument(
         "--type",
-        choices=["ndc", "ff", "all"],
+        choices=["ndc", "ff", "prejoining", "all"],
         default="all",
-        help="Type of reports to upload: 'ndc' (Excel files), 'ff' (Employee F&F folders), or 'all' (default).",
+        help="Type of reports to upload: 'ndc' (Excel files), 'ff' (Employee F&F folders), 'prejoining' (Pre-Joining reports), or 'all' (default).",
     )
     parser.add_argument(
         "--file",
@@ -447,6 +444,10 @@ async def main():
                     print(f"[{ts()}] Starting F&F reports upload...")
                     await upload_ff_reports(client, site_id, drive_id, folder_path)
 
+                if args.type in ["prejoining", "all"]:
+                    print(f"[{ts()}] Starting Pre-Joining reports upload...")
+                    await upload_prejoining_reports(client, site_id, drive_id, folder_path)
+
     except ValueError as e:
         print(f"\n[{ts()}] [ERROR] Configuration Error: {traceback.format_exc()}")
     except FileNotFoundError as e:
@@ -458,4 +459,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    setup_logger("upload_to_sharepoint.log")
     asyncio.run(main())

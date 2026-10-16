@@ -17,6 +17,6 @@ wheels/
 
 # Folders
 chrome_automation_profile/
-backup_code/
-NDC_Reports/
+uploads/
 logs/
+errors/

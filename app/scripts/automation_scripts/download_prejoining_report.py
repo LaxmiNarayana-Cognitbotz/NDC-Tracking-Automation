@@ -1,78 +1,63 @@
 """
-OpenText Content Server - F&F (Full & Final) Exit Document Downloader
+OpenText Content Server - Pre-Joining & Talent Acquisition Document Downloader
+Downloads onboarding documents: Appointment Letter, Offer Letter, Background Verification (BGV),
+Pre Talent Acquisition, Offer of Appointment, LOI, etc.
 """
+
+import sys
+from pathlib import Path
+
+# Add project root to sys.path so the script can be run directly or via VS Code Run
+ROOT_DIR = Path(__file__).resolve().parents[3]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 import asyncio
 import glob
 import os
 import re
-import sys
 import traceback
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import pandas as pd
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-# ── Logging Setup ────────────────────────────────────────────────────────────
-LOG_DIR = Path(__file__).parent.parent / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "download_ff_report.log"
+import app.scripts.processing_scripts.upload_to_sharepoint as sp_uploader
+from app.core.config import (
+    AUTOMATION_PROFILE_DIR,
+    PREJOINING_ERRORS_DIR,
+    PREJOINING_REPORTS_DIR,
+    ROOT_DIR,
+)
+from app.core.logger import setup_logger
 
-
-class LoggerWriter:
-    def __init__(self, file_path):
-        self.terminal = sys.stdout
-        self.file_path = file_path
-
-    def write(self, message):
-        try:
-            with open(self.file_path, "a", encoding="utf-8") as f:
-                f.write(message)
-        except Exception:
-            pass
-        if self.terminal is not None:
-            try:
-                self.terminal.write(message)
-            except UnicodeEncodeError:
-                try:
-                    self.terminal.write(message.encode("cp1252", errors="replace").decode("cp1252"))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-    def flush(self):
-        if self.terminal is not None:
-            try:
-                self.terminal.flush()
-            except Exception:
-                pass
-
-
-sys.stdout = LoggerWriter(LOG_FILE)
-sys.stderr = LoggerWriter(LOG_FILE)
+# ==== Logging Setup ====
+LOG_FILE = setup_logger("download_prejoining_report.log")
 
 load_dotenv(verbose=True)
 
-# ── Configuration ────────────────────────────────────────────────────────────
+# ==== Configuration ====
 
-# SSO credentials (same as NDC script)
+# SSO credentials
 ORACLE_EMAIL = os.getenv("ORACLE_EMAIL")
 ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD")
 
 # Content Server URL
 CONTENT_SERVER_URL = os.getenv("CONTENT_SERVER_URL")
 
-# Output directory for downloaded F&F documents
-DOWNLOAD_DIR = Path(__file__).parent.parent / "uploads" / "FF_Reports"
+# Output directory for downloaded Pre-Joining documents
+DOWNLOAD_DIR = PREJOINING_REPORTS_DIR
+
+# Master Excel summary file path (single persistent file tracking all employees)
+MASTER_EXCEL_PATH = DOWNLOAD_DIR / "Master_Pre_Joining_Summary.xlsx"
 
 # Standalone automation profile (persists browser session between runs)
-AUTOMATION_PROFILE_DIR = Path(__file__).parent.parent / "chrome_automation_profile"
 
-# Headless mode
+# Headless mode and window configuration
 HEADLESS = os.getenv("HEADLESS", "true").lower()
+START_MAXIMIZED = os.getenv("START_MAXIMIZED", "false").lower() == "true"
 
 # Default timeout for individual element interactions (ms)
 ELEMENT_TIMEOUT = 15_000
@@ -86,15 +71,14 @@ MAX_CONCURRENT_TABS = 5
 # How long to wait for the search results page to fully render (ms)
 SEARCH_RESULTS_WAIT = 45_000
 
-# ── Result Status Constants ──────────────────────────────────────────────────
-# Used to distinguish different outcomes per employee so the summary is clear.
-STATUS_DOWNLOADED = "DOWNLOADED"          # F&F sheet found and saved
-STATUS_NO_FF_DOCS = "NO_FF_DOCS"          # Folder found, but no F&F sheet uploaded
+# ==== Result Status Constants ====
+STATUS_DOWNLOADED = "DOWNLOADED"          # Matching documents found and saved
+STATUS_NO_DOCS    = "NO_PREJOINING_DOCS"  # Folder found, but no matching onboarding documents
 STATUS_NOT_FOUND  = "NOT_FOUND_0_HITS"    # Content Server returned 0 search results
 STATUS_ERROR      = "ERROR"               # Search timeout, network failure, etc.
 
 # Error screenshot directory
-ERROR_SCREENSHOT_DIR = Path(__file__).parent.parent / "errors" / "ff_error"
+ERROR_SCREENSHOT_DIR = PREJOINING_ERRORS_DIR
 
 
 def ts():
@@ -116,12 +100,14 @@ def _cleanup_profile_locks():
 
 
 def cleanup_error_screenshots(employee_number: str):
-    """Delete all debug error screenshots for the given employee from errors/ff_error/."""
+    """Delete all debug error screenshots for the given employee from errors/Pre_Joining_Errors/."""
     if not ERROR_SCREENSHOT_DIR.exists():
         return
+    clean_id = re.sub(r"\D", "", str(employee_number))
     patterns = [
-        str(ERROR_SCREENSHOT_DIR / f"debug_*_{employee_number}.png"),
-        str(ERROR_SCREENSHOT_DIR / f"debug_error_{employee_number}_*.png"),
+        str(ERROR_SCREENSHOT_DIR / f"prejoining_*_{clean_id}_*.png"),
+        str(ERROR_SCREENSHOT_DIR / f"download_prejoining_report_*_{clean_id}_*.png"),
+        str(ERROR_SCREENSHOT_DIR / f"debug_*_{clean_id}*.png"),
     ]
     for pattern in patterns:
         for path in glob.glob(pattern):
@@ -133,56 +119,62 @@ def cleanup_error_screenshots(employee_number: str):
 
 
 def _extract_employee_id_from_debug_screenshot(path: Path) -> Optional[str]:
-    """Extract employee ID from debug_{label}_{employee_id}.png screenshots."""
-    match = re.match(r"^debug_[a-z_]+_(\d+)$", path.stem, flags=re.IGNORECASE)
+    """
+    Extract employee ID from debug screenshot filename:
+    Pattern: prejoining_{error_type}_{employee_id}_{timestamp}.png
+    """
+    stem = path.stem
+    match = re.search(r"(?:prejoining|download_prejoining_report)_[a-z_]+_(\d{6,10})_", stem, flags=re.IGNORECASE)
     if match:
         return match.group(1)
 
-    # Backward compatibility for older timestamped error screenshots.
-    match = re.match(r"^debug_error_(\d+)_\d+$", path.stem, flags=re.IGNORECASE)
-    if match:
-        return match.group(1)
+    match2 = re.search(r"(?<!\d)(\d{6,10})(?!\d)", stem)
+    if match2:
+        return match2.group(1)
 
     return None
 
 
 def _debug_screenshot_path(label: str, employee_number: Optional[str] = None) -> Path:
+    """
+    Construct screenshot filename containing:
+    prejoining_{error_type}_{employee_id}_{13_Oct_2026_(HH.MMam/pm)}.png
+    """
     safe_label = re.sub(r"[^A-Za-z_]+", "_", label).strip("_").lower()
+    now_str = datetime.now().strftime("%d_%b_%Y_(%I.%M%p)")
     if employee_number:
-        return ERROR_SCREENSHOT_DIR / f"debug_{safe_label}_{employee_number}.png"
-    return ERROR_SCREENSHOT_DIR / f"debug_{safe_label}.png"
-
-
-async def save_debug_screenshot(page, label: str, employee_number: Optional[str] = None) -> str:
-    """Save a full-page screenshot for debugging."""
-    ERROR_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
-    path = _debug_screenshot_path(label, employee_number)
-    try:
-        await page.screenshot(path=str(path), full_page=True)
-        print(f"[{ts()}]   Screenshot: {path}")
-    except Exception as e:
-        print(f"[{ts()}]   Could not save screenshot: {e}")
-    return str(path)
+        clean_id = re.sub(r"\D", "", str(employee_number))
+        return ERROR_SCREENSHOT_DIR / f"prejoining_{safe_label}_{clean_id}_{now_str}.png"
+    return ERROR_SCREENSHOT_DIR / f"prejoining_{safe_label}_{now_str}.png"
 
 
 def get_failed_ids_from_error_folder() -> List[str]:
     """
-    Scan errors/ff_error/ for debug screenshots and extract unique
+    Scan errors/Pre_Joining_Errors/ for debug screenshots and extract unique
     employee IDs from the filenames.
-
-    Filename pattern: debug_{label}_{employee_id}.png
-    Example: debug_error_30087487.png  ->  "30087487"
     """
     if not ERROR_SCREENSHOT_DIR.exists():
         return []
     seen = set()
     ids = []
-    for path in ERROR_SCREENSHOT_DIR.glob("debug_*.png"):
+    for path in sorted(ERROR_SCREENSHOT_DIR.glob("*.png")):
         emp_id = _extract_employee_id_from_debug_screenshot(path)
         if emp_id and emp_id not in seen:
             seen.add(emp_id)
             ids.append(emp_id)
     return ids
+
+
+async def save_debug_screenshot(page, label: str, employee_number: Optional[str] = None) -> str:
+    """Save a full-page diagnostic screenshot formatted with source script, label, employee ID, date, and time."""
+    ERROR_SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+    path = _debug_screenshot_path(label, employee_number)
+    try:
+        await page.screenshot(path=str(path), full_page=True)
+        print(f"[{ts()}]   Screenshot saved: {path.name}")
+    except Exception as e:
+        print(f"[{ts()}]   Could not save screenshot: {e}")
+    return str(path)
 
 
 async def check_and_dismiss_error_dialog(page) -> bool:
@@ -191,7 +183,6 @@ async def check_and_dismiss_error_dialog(page) -> bool:
     Returns True if an error dialog was found and dismissed.
     """
     try:
-        # Look for common Content Server error modals
         error_selectors = [
             'div.binf-modal-dialog:has-text("Error")',
             'div.binf-modal-content:has-text("Error")',
@@ -205,7 +196,6 @@ async def check_and_dismiss_error_dialog(page) -> bool:
                     error_text = (await dialog.inner_text()).strip().replace("\n", " ")[:200]
                     print(f"[{ts()}] [WARN] Content Server error dialog detected: {error_text}")
 
-                    # Try to click the Close button
                     close_selectors = [
                         'button:has-text("Close")',
                         'button.binf-btn:has-text("Close")',
@@ -224,7 +214,6 @@ async def check_and_dismiss_error_dialog(page) -> bool:
                         except Exception:
                             continue
 
-                    # If no Close button, press Escape
                     await page.keyboard.press("Escape")
                     print(f"[{ts()}]   Dismissed error dialog via Escape key")
                     await page.wait_for_timeout(1500)
@@ -236,7 +225,7 @@ async def check_and_dismiss_error_dialog(page) -> bool:
     return False
 
 
-# ── SSO Handling (ported from download_ndc_report.py) ────────────────────────
+# ==== SSO Handling ====
 
 async def check_for_sso_errors(page):
     """Check if Microsoft SSO shows a validation error, and raise an exception if found."""
@@ -276,22 +265,17 @@ async def _handle_microsoft_sso(page):
 
     print(f"[{ts()}] SSO login detected -- filling credentials automatically...")
 
-    # ── Dynamic SSO State Machine ─────────────────────────────────────────
-    # Since Microsoft login screens can appear in unpredictable order (skipping
-    # email, asking for account pick first, or direct password), we dynamically
-    # detect which form element is currently active and handle it.
     email_filled = False
     password_filled = False
     rsa_clicked = False
 
     for iteration in range(15):
-        # 0. Check if we have been redirected away from Microsoft SSO
         current_url = page.url.lower()
         if not any(x in current_url for x in ["login.microsoftonline", "login.microsoft", "adfs", "saml"]):
             print(f"[{ts()}]   SSO login completed -- redirected away from login screen.")
             return True
 
-        # 1. "Pick an account" screen (check this first before touching inputs)
+        # ==== Pick an account screen ====
         if not email_filled and not password_filled:
             try:
                 pick_header = page.locator('div#loginHeader:has-text("Pick an account"), div[role="heading"]:has-text("Pick an account")').first
@@ -351,10 +335,7 @@ async def _handle_microsoft_sso(page):
             except Exception:
                 pass
 
-        # 2. Password input screen
-        # To avoid false positives on the email screen (where password box exists in DOM),
-        # we require EITHER that email was already filled in step 1, OR that explicit password
-        # screen indicators are visible ("Enter password" heading, "Sign in" button, or back-arrow banner).
+        # ==== Password input screen ====
         if not password_filled:
             try:
                 pw_input = page.locator('input[name="passwd"], input[id="i0118"], input[type="password"]').first
@@ -377,7 +358,7 @@ async def _handle_microsoft_sso(page):
                         try:
                             await check_for_sso_errors(page)
                             password_filled = True
-                            email_filled = True  # Email step wasn't needed
+                            email_filled = True
                             break
                         except RuntimeError as e:
                             if attempt == 3:
@@ -389,7 +370,7 @@ async def _handle_microsoft_sso(page):
             except Exception:
                 pass
 
-        # 3. Email input screen (only if password not filled and email not filled)
+        # ==== Email input screen ====
         if not email_filled and not password_filled:
             try:
                 email_input = page.locator('input[name="loginfmt"], input[type="email"], input[id="i0116"]').first
@@ -422,7 +403,7 @@ async def _handle_microsoft_sso(page):
             except Exception:
                 pass
 
-        # 4. RSA / MFA "Verify your identity" screen
+        # ==== RSA / MFA Verify your identity screen ====
         if not rsa_clicked:
             try:
                 rsa_btn = page.locator('div[role="button"], button').filter(has_text="RSAEntraMFA").first
@@ -432,17 +413,15 @@ async def _handle_microsoft_sso(page):
                     print(f"[{ts()}]   Clicked 'Approve with RSAEntraMFA'")
                     await page.wait_for_timeout(3000)
                     rsa_clicked = True
-                    break  # Break loop and wait for push approval
+                    break
             except Exception:
                 pass
 
-        # If password was already filled and we are just waiting for MFA/redirect or KMSI
         if password_filled:
             break
 
         await page.wait_for_timeout(1000)
 
-    # ── Step 4: RSA / MFA approval ────────────────────────────────────────
     print(f"[{ts()}] Waiting for RSA/MFA approval...")
     print()
     print("  +------------------------------------------------------------+")
@@ -455,17 +434,7 @@ async def _handle_microsoft_sso(page):
     return True
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-async def safe_click(locator, description: str, timeout: int = ELEMENT_TIMEOUT):
-    """Wait for an element to be visible, scroll into view, then click it."""
-    try:
-        await locator.wait_for(state="visible", timeout=timeout)
-        await locator.scroll_into_view_if_needed()
-        await locator.click(timeout=timeout)
-    except PlaywrightTimeoutError:
-        raise RuntimeError(f"Could not click '{description}' within {timeout}ms")
-
+# ==== Helpers ====
 
 async def click_with_fallback(
     page_or_frame, selectors: list, description: str, timeout_each: int = 10_000
@@ -504,14 +473,11 @@ async def wait_for_content_server_home(page, timeout_s: int = 300):
     deadline = asyncio.get_event_loop().time() + timeout_s
 
     while asyncio.get_event_loop().time() < deadline:
-
-        # ── Check if we're on a login/SSO page ────────────────────────────
         current_url = page.url.lower()
         if any(x in current_url for x in ["login.microsoftonline", "login.microsoft", "adfs", "saml"]):
             if not login_handled:
                 login_handled = await _handle_microsoft_sso(page)
 
-        # ── Handle RSA / SecurID Rejection ────────────────────────────────
         try:
             if "securid.com" in current_url or "adani.auth" in current_url:
                 retry_btn = page.locator('button:has-text("Retry")').first
@@ -532,7 +498,6 @@ async def wait_for_content_server_home(page, timeout_s: int = 300):
         except Exception:
             pass
 
-        # ── Handle "Stay signed in?" prompt ───────────────────────────────
         try:
             stay_signed = page.locator('#idSIButton9, input[value="Yes"]').first
             if await stay_signed.is_visible(timeout=1000):
@@ -543,7 +508,6 @@ async def wait_for_content_server_home(page, timeout_s: int = 300):
         except Exception:
             pass
 
-        # ── Check for Content Server home page ────────────────────────────
         for sel in home_selectors:
             try:
                 if await page.locator(sel).first.is_visible(timeout=2000):
@@ -563,7 +527,7 @@ async def wait_for_content_server_home(page, timeout_s: int = 300):
 async def search_employee(page, employee_number: str):
     """
     Perform a search in Content Server for the given employee number.
-    Flow: Click search icon -> type in search box -> click search button.
+    Flow: Click search icon -> type in search box -> click search submit button.
     """
     print(f"[{ts()}] Searching for employee: {employee_number}")
 
@@ -623,7 +587,7 @@ async def search_employee(page, employee_number: str):
     # Give Content Server time to dispatch query and detach old DOM
     await page.wait_for_timeout(3500)
 
-    # Step 5: Wait for search results to appear
+    # Step 5: Wait for search results
     if await check_and_dismiss_error_dialog(page):
         print(f"[{ts()}]   Error dialog dismissed -- retrying search for {employee_number}")
         await navigate_home(page)
@@ -632,41 +596,34 @@ async def search_employee(page, employee_number: str):
         return
 
     try:
-        # First, explicitly wait for the loading spinner to disappear
         try:
             spinner = page.locator(".csui-loading-parent-wrapper, .binf-list-group-loading, .load-container, .cs-indicator").first
             await spinner.wait_for(state="hidden", timeout=SEARCH_RESULTS_WAIT)
         except Exception:
             pass
 
-        # Then wait for the results container to be visible
         await page.locator("#results, div.binf-list-group, .csui-search-results").first.wait_for(
             state="visible", timeout=SEARCH_RESULTS_WAIT
         )
     except PlaywrightTimeoutError:
-        # Check for error dialog that appeared during search
+        try:
+            zero_hits_loc = page.locator('text=/About 0 hits/i').first
+            if await zero_hits_loc.is_visible(timeout=2000):
+                print(f"[{ts()}]   Employee {employee_number} not found on Content Server (0 hits) -- skipping")
+                raise RuntimeError(
+                    f"Employee {employee_number} not found on Content Server (0 search results)"
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+
         if await check_and_dismiss_error_dialog(page):
             print(f"[{ts()}]   Error dialog appeared during search -- skipping {employee_number}")
             raise RuntimeError(
                 f"Content Server error during search for employee {employee_number}"
             )
 
-        # Check if the search page genuinely shows "About 0 hits"
-        try:
-            zero_hits_loc = page.locator('text=/About 0 hits/i').first
-            if await zero_hits_loc.is_visible(timeout=3000):
-                link_count = await page.locator(f'a:has-text("{employee_number}")').count()
-                if link_count == 0:
-                    print(f"[{ts()}]   Employee {employee_number} not found on Content Server (0 hits) -- skipping")
-                    raise RuntimeError(
-                        f"Employee {employee_number} not found on Content Server (0 search results)"
-                    )
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-
-        # Genuine timeout -- the server is too slow
         await save_debug_screenshot(page, "no_results", employee_number)
         raise RuntimeError(
             f"Search results did not appear for employee {employee_number} (timeout)"
@@ -676,21 +633,15 @@ async def search_employee(page, employee_number: str):
 async def click_employee_master_folder(page, employee_number: str):
     """
     Finds and clicks the employee's master folder in the search results.
-    The folder's name should match the employee number exactly.
-
-    Includes a polling wait (up to 15s) to ensure search results have fully
-    rendered in the DOM before checking -- this avoids false negatives caused
-    by concurrent tab searches overwhelming Content Server.
+    The folder's name should match the employee number.
     """
-    print(f"[{ts()}] Looking for exact master folder match: {employee_number}")
-
-    # ── Polling wait: ensure search results are actually rendered ──────────
+    # ==== Polling wait: ensure search results are actually rendered ====
     # Content Server takes time under concurrent tab load.
     # We poll up to 8 times (8 x 2.5s = 20s) looking for the employee link.
     # Crucially: We do NOT abort early on poll 0/1 for "0 hits" to avoid false negatives
     # caused by leftover DOM text from a previous search!
     for _poll in range(8):
-        # 1. First priority: Check if any link matching employee number exists
+        # ==== Check if link matching employee number exists ====
         try:
             loc = page.get_by_role("link", name=employee_number, exact=True).first
             if await loc.is_visible(timeout=1000):
@@ -710,7 +661,7 @@ async def click_employee_master_folder(page, employee_number: str):
         except Exception:
             pass
 
-        # 2. Only after at least 3 polls (after 7+ seconds of waiting), check for genuine "0 hits"
+        # ==== Check for genuine 0 hits after initial polls ====
         if _poll >= 3:
             try:
                 zero_hits_loc = page.locator('text=/About 0 hits/i').first
@@ -728,7 +679,7 @@ async def click_employee_master_folder(page, employee_number: str):
         # Wait before next poll
         await page.wait_for_timeout(2500)
 
-    # ── Strategy 1: Exact text matching using Playwright role locator ─────
+    # Strategy 1: Exact text matching using role locator
     try:
         loc = page.get_by_role("link", name=employee_number, exact=True).first
         if await loc.is_visible(timeout=5000):
@@ -739,7 +690,7 @@ async def click_employee_master_folder(page, employee_number: str):
     except Exception:
         pass
 
-    # ── Strategy 2: Match by exact title / aria-label / data-binf-original-title
+    # Strategy 2: Match by exact title / aria-label / data-binf-original-title
     try:
         loc = page.locator(
             f'a[title="{employee_number}"], '
@@ -754,7 +705,7 @@ async def click_employee_master_folder(page, employee_number: str):
     except Exception:
         pass
 
-    # ── Strategy 3: Iterate and check exact inner_text ────────────────────
+    # Strategy 3: Iterate and check exact inner_text
     selectors = [
         ".csui-search-item a",
         "div.csui-search-item a",
@@ -777,19 +728,16 @@ async def click_employee_master_folder(page, employee_number: str):
         except Exception:
             pass
 
-    # Do NOT click the first search result -- it may belong to a different employee.
-    # This was causing the script to navigate into wrong folders and fail.
     raise RuntimeError(
         f"Employee folder '{employee_number}' not found in search results -- skipping"
     )
 
 
-async def click_adani_exit_documents(page, employee_number: Optional[str] = None):
+async def click_prejoining_folder(page, employee_number: str = ""):
     """
-    Click the 'Adani Exit Documents' folder link inside the employee folder.
-    This navigates into the subfolder containing the F&F documents.
+    Click the 'Pre Joining and Talent Acquisition Stage' folder link inside the employee folder.
     """
-    # Wait for the table to render first
+    # Wait for the folder table to render
     try:
         await page.locator("td.csui-table-cell-name").first.wait_for(
             state="visible", timeout=ELEMENT_TIMEOUT
@@ -800,10 +748,10 @@ async def click_adani_exit_documents(page, employee_number: Optional[str] = None
 
     await page.wait_for_timeout(1500)
 
-    # Click the "Adani Exit Documents" link (exact match to avoid clicking files)
-    # First try exact role locator
+    # Strategy 1: Regex / Role matching
+    folder_regex = re.compile(r"(?:pre[_\s\-]*joining|talent[_\s\-]*acquisition)", re.I)
     try:
-        exact_folder = page.get_by_role("link", name="Adani Exit Documents", exact=True).first
+        exact_folder = page.get_by_role("link", name=folder_regex).first
         if await exact_folder.is_visible(timeout=5000):
             await exact_folder.scroll_into_view_if_needed()
             await exact_folder.click()
@@ -812,82 +760,166 @@ async def click_adani_exit_documents(page, employee_number: Optional[str] = None
     except Exception:
         pass
 
-    # Fallback to standard locators with exact matching priority
-    await click_with_fallback(
-        page,
-        [
-            'a[title="Adani Exit Documents"]',
-            'a[aria-label="Adani Exit Documents"]',
-            'text="Adani Exit Documents"',
-            'xpath=//a[text()="Adani Exit Documents"]',
-            'a:has-text("Adani Exit Documents")',
-            "tr.csui-state-hover > td.csui-table-cell-name a > span",
-            'xpath=//span[contains(text(),"Adani Exit Documents")]',
-            'xpath=//a[contains(.,"Adani Exit Documents")]',
-        ],
-        "Adani Exit Documents folder",
-        timeout_each=ELEMENT_TIMEOUT,
+    # Strategy 2: Specific folder names and locators
+    selectors = [
+        'a[title="Pre Joining and Talent Acquisition Stage"]',
+        'a[aria-label="Pre Joining and Talent Acquisition Stage"]',
+        'text="Pre Joining and Talent Acquisition Stage"',
+        'xpath=//a[contains(.,"Pre Joining") and contains(.,"Talent Acquisition")]',
+        'xpath=//span[contains(.,"Pre Joining") and contains(.,"Talent Acquisition")]',
+        'xpath=//a[contains(translate(., "PRE JOINING", "pre joining"), "pre joining")]',
+        'xpath=//a[contains(translate(., "TALENT ACQUISITION", "talent acquisition"), "talent acquisition")]',
+        'a:has-text("Pre Joining")',
+        'a:has-text("Talent Acquisition")',
+        "tr.csui-state-hover > td.csui-table-cell-name a > span",
+    ]
+
+    try:
+        await click_with_fallback(
+            page,
+            selectors,
+            "Pre Joining and Talent Acquisition Stage folder",
+            timeout_each=ELEMENT_TIMEOUT,
+        )
+        await page.wait_for_timeout(3000)
+        return
+    except RuntimeError:
+        pass
+
+    # Strategy 3: Iterate through all table rows to match folder text
+    try:
+        rows = page.locator("tbody tr td.csui-table-cell-name a, tbody tr td.csui-table-cell-name span")
+        count = await rows.count()
+        for i in range(count):
+            loc = rows.nth(i)
+            text = (await loc.inner_text()).strip()
+            if folder_regex.search(text):
+                print(f"[{ts()}]   Matched Pre-Joining folder row text: '{text}'")
+                await loc.scroll_into_view_if_needed()
+                await loc.click()
+                await page.wait_for_timeout(3000)
+                return
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Could not find 'Pre Joining and Talent Acquisition Stage' folder"
     )
-    await page.wait_for_timeout(3000)
 
 
 async def get_document_count(page) -> int:
     """Count the number of document rows in the current folder table."""
     try:
-        # Wait for the table to be visible
         await page.locator("tbody tr").first.wait_for(
             state="visible", timeout=ELEMENT_TIMEOUT
         )
         await page.wait_for_timeout(1000)
 
-        # Count rows that have a name cell (actual document rows)
         rows = page.locator("tbody tr td.csui-table-cell-name")
         count = await rows.count()
-        print(f"[{ts()}] Found {count} document(s)")
+        print(f"[{ts()}] Found {count} item(s) in folder")
         return count
     except PlaywrightTimeoutError:
-        print(f"[{ts()}]   No document rows found in the folder")
+        print(f"[{ts()}]   No items found in the folder")
         return 0
 
 
-# ── F&F Document Name Filter ─────────────────────────────────────────────────
-# Strong regex to match ONLY F&F (Full & Final) sheet documents.
-# Matches:  "F AND F", "F&F", "FNF", "F_AND_F", "FULL AND FINAL", "FULL_AND_FINAL"
-# Case-insensitive. Rejects experience letters, relieving letters, resignation
-# letters, NDC forms, undertakings, and any other non-F&F documents.
-FF_DOCUMENT_PATTERN = re.compile(
-    r"(?i)"
-    r"("
-    r"F\s*AND\s*F"
-    r"|F\s*&\s*F"
-    r"|F[_\-\s]*N[_\-\s]*F"
-    r"|F_AND_F"
-    r"|FULL\s*AND\s*FINAL"
-    r"|FULL[_\-]AND[_\-]FINAL"
+# ==== Strong Regex Pattern for Pre-Joining & Talent Acquisition Documents ====
+# Matches:
+# - Appointment Letter / Letter of Appointment / Offer of Appointment / Appointment
+# - Offer Letter / OFFER_LETTER_OR_LETTER_ON_INTENT / Letter of Intent / Letter on Intent / LOI
+# - Background Verification / BACKGROUND_VERIFICATION_REPORT / BGV Report / Background Check
+# - Pre Talent Acquisition / Talent Acquisition / Pre Joining
+PREJOINING_DOCUMENT_PATTERN = re.compile(
+    r"(?i)("
+    r"appointment[_\s\-]*letter"
+    r"|letter[_\s\-]*of[_\s\-]*appointment"
+    r"|offer[_\s\-]*of[_\s\-]*appointment"
+    r"|offer[_\s\-]*&[_\s\-]*appointment"
+    r"|offer[_\s\-]*letter(?:[_\s\-]*or[_\s\-]*letter[_\s\-]*(?:of|on)[_\s\-]*intent)?"
+    r"|letter[_\s\-]*(?:of|on)[_\s\-]*intent"
+    r"|(?<![a-zA-Z])loi(?![a-zA-Z])"
+    r"|background[_\s\-]*verification(?:[_\s\-]*report)?"
+    r"|(?<![a-zA-Z])bgv(?:[_\s\-]*report)?(?![a-zA-Z])"
+    r"|background[_\s\-]*check"
+    r"|pre[_\s\-]*talent[_\s\-]*acquisition"
+    r"|talent[_\s\-]*acquisition"
+    r"|pre[_\s\-]*joining"
+    r")"
+)
+
+# ==== Per-Category Regex Classifiers for Excel summary report ====
+# These classify each downloaded file into one of the 3 document categories.
+
+_OFFER_LETTER_PATTERN = re.compile(
+    r"(?i)("
+    r"offer[_\s\-]*letter(?:[_\s\-]*or[_\s\-]*letter[_\s\-]*(?:of|on)[_\s\-]*intent)?"
+    r"|letter[_\s\-]*(?:of|on)[_\s\-]*intent"
+    r"|(?<![a-zA-Z])loi(?![a-zA-Z])"
+    r"|offer[_\s\-]*of[_\s\-]*appointment"
+    r"|offer[_\s\-]*&[_\s\-]*appointment"
+    r")"
+)
+
+_BGV_PATTERN = re.compile(
+    r"(?i)("
+    r"background[_\s\-]*verification(?:[_\s\-]*report)?"
+    r"|(?<![a-zA-Z])bgv(?:[_\s\-]*report)?(?![a-zA-Z])"
+    r"|background[_\s\-]*check"
+    r")"
+)
+
+_APPOINTMENT_LETTER_PATTERN = re.compile(
+    r"(?i)("
+    r"appointment[_\s\-]*letter"
+    r"|letter[_\s\-]*of[_\s\-]*appointment"
     r")"
 )
 
 
-def _is_ff_document(name: str) -> bool:
-    """Return True only if the document name matches the F&F pattern."""
-    return bool(FF_DOCUMENT_PATTERN.search(name))
+# ==== Disqualify any document from previous employment / previous experience ====
+PREVIOUS_DOC_PATTERN = re.compile(
+    r"(?i)(?:previous|prior[_\s\-]*employ|past[_\s\-]*employ)",
+)
+
+
+def _classify_document(filename: str) -> List[str]:
+    """
+    Classify a downloaded filename into one or more categories.
+    Returns a list of matched categories: 'Offer Letter', 'Background Verification', 'Appointment Letter'.
+    Excludes any document containing 'previous' or from previous employment.
+    """
+    if PREVIOUS_DOC_PATTERN.search(filename):
+        return []
+
+    categories = []
+    if _OFFER_LETTER_PATTERN.search(filename):
+        categories.append("Offer Letter")
+    if _BGV_PATTERN.search(filename):
+        categories.append("Background Verification")
+    if _APPOINTMENT_LETTER_PATTERN.search(filename):
+        categories.append("Appointment Letter")
+    return categories
+
+
+def _is_prejoining_document(name: str) -> bool:
+    """Return True only if the document name matches the strong regex pattern and is NOT from previous employment."""
+    if PREVIOUS_DOC_PATTERN.search(name):
+        return False
+    return bool(PREJOINING_DOCUMENT_PATTERN.search(name))
 
 
 async def download_document_at_row(
-    page, row_index: int, total_rows: int, download_dir: Path, employee_number: str
+    page, row_index: int, total_rows: int, download_dir: Path, employee_number: str = ""
 ) -> Optional[str]:
     """
     Download a single document from the folder table by its 1-based row index.
-    Flow: hover row -> check if folder -> check F&F name -> click "More actions" -> click "Download".
-
-    Only downloads documents whose name matches the F&F regex pattern.
-    The row_index is 1-based matching the <tr> nth-of-type in the DOM.
+    Flow: hover row -> check regex match -> click "More actions" -> click "Download".
     """
     row_selector = f"tbody tr:nth-of-type({row_index})"
     try:
         row = page.locator(row_selector).first
 
-        # Try scrolling the row into view first to handle lazy-loaded or off-screen rows
         try:
             await row.scroll_into_view_if_needed(timeout=5000)
         except Exception:
@@ -895,42 +927,28 @@ async def download_document_at_row(
 
         await row.wait_for(state="visible", timeout=ELEMENT_TIMEOUT)
 
-        # Get the row name for logging
+        # Get row name
         row_name = f"Row {row_index}"
         name_cell = row.locator("td.csui-table-cell-name a, td.csui-table-cell-name").first
         if await name_cell.count() > 0:
             row_name = (await name_cell.inner_text()).strip()
 
-        # Check if the row represents a folder instead of a file
-        is_folder = False
-        # Get the second column (icon column)
-        icon_cell = row.locator("td:nth-of-type(2), td.csui-table-cell-icon, td.csui-table-cell-type, td:nth-child(2)").first
-        if await icon_cell.count() > 0:
-            html = await icon_cell.inner_html()
-            html_lower = html.lower()
-            if "folder" in html_lower or "csui-icon-node-folder" in html_lower:
-                is_folder = True
-
-        if is_folder:
-            print(f"[{ts()}] Skipping folder: '{row_name}' (row {row_index}/{total_rows})")
+        # Check regex match
+        if not _is_prejoining_document(row_name):
+            print(f"[{ts()}] Skipping non-matching document: '{row_name}' (row {row_index}/{total_rows})")
             return None
 
-        # ── F&F Filter: Only download F&F sheet documents ─────────────────
-        if not _is_ff_document(row_name):
-            print(f"[{ts()}] Skipping non-F&F document: '{row_name}' (row {row_index}/{total_rows})")
-            return None
-
-        # Create the local folder only now that we know we have a valid F&F document
+        # Create output directory
         download_dir.mkdir(parents=True, exist_ok=True)
 
-        print(f"[{ts()}] Downloading F&F document: '{row_name}' (row {row_index}/{total_rows})...")
+        print(f"[{ts()}] Downloading matching document: '{row_name}' (row {row_index}/{total_rows})...")
         await row.hover()
         await page.wait_for_timeout(1000)
     except Exception as e:
         print(f"[{ts()}]   Could not analyze or hover row {row_index}: {e}")
         return None
 
-    # Click "More actions" (the ... dropdown menu) for this row
+    # Click "More actions" (...) dropdown
     more_actions_selectors = [
         f"tbody tr:nth-of-type({row_index}) li.binf-dropdown > a",
         f'xpath=//tbody/tr[{row_index}]//li[contains(@class,"binf-dropdown")]/a',
@@ -945,7 +963,6 @@ async def download_document_at_row(
             timeout_each=8000,
         )
     except RuntimeError:
-        # Fallback: try the generic "More actions" locator after hovering
         try:
             more_btn = page.locator('a[title="More actions"]').first
             if await more_btn.is_visible(timeout=5000):
@@ -958,14 +975,11 @@ async def download_document_at_row(
 
     await page.wait_for_timeout(1500)
 
-    # ── Click "Download" from the dropdown menu ──────────────────────────
-    # The dropdown items can be hidden until the menu is fully expanded.
-    # Strategy: try visible click first, then force-click on hidden elements.
+    # Click "Download" from dropdown menu
     try:
         async with page.expect_download(timeout=60_000) as dl_info:
             download_clicked = False
 
-            # Attempt 1: Try standard visible selectors
             download_selectors = [
                 'a[title="Download"]',
                 'ul.binf-dropdown-menu a[title="Download"]',
@@ -984,7 +998,6 @@ async def download_document_at_row(
                 except Exception:
                     continue
 
-            # Attempt 2: Force-click on hidden Download link (common in this UI)
             if not download_clicked:
                 force_selectors = [
                     'a[title="Download"]',
@@ -994,7 +1007,6 @@ async def download_document_at_row(
                 for sel in force_selectors:
                     try:
                         loc = page.locator(sel).first
-                        # Check element exists in DOM even if hidden
                         if await loc.count() > 0:
                             await loc.click(force=True, timeout=8000)
                             download_clicked = True
@@ -1004,7 +1016,6 @@ async def download_document_at_row(
                         continue
 
             if not download_clicked:
-                # Attempt 3: Use keyboard shortcut or dispatch click event via JS
                 try:
                     await page.evaluate("""
                         () => {
@@ -1029,11 +1040,10 @@ async def download_document_at_row(
             print(f"[{ts()}]   Download failed for row {row_index}: {failure}")
             return None
 
-        suggested = download.suggested_filename or f"ff_document_{row_index}"
-        
-        # ── Sanitize filename and correct/force extensions ───────────────────
+        suggested = download.suggested_filename or f"doc_{row_index}"
+
+        # Sanitize filename and correct extension
         suggested_clean = suggested.strip()
-        # Pattern matching: ". <digits>" suffix (e.g. ". 2")
         match = re.search(r"\.\s*(\d+)$", suggested_clean)
         if match:
             suffix_num = match.group(1)
@@ -1041,13 +1051,13 @@ async def download_document_at_row(
             suggested_clean = f"{base}_{suffix_num}.pdf"
         else:
             ext = Path(suggested_clean).suffix.lower()
-            if ext not in [".pdf", ".xlsx", ".xls", ".doc", ".docx", ".png", ".jpg"]:
+            if ext not in [".pdf", ".xlsx", ".xls", ".doc", ".docx", ".png", ".jpg", ".zip"]:
                 suggested_clean = suggested_clean.rstrip(".")
                 suggested_clean = f"{suggested_clean}.pdf"
 
         save_path = download_dir / suggested_clean
 
-        # Handle duplicate filenames by appending a counter
+        # Handle duplicate filenames
         if save_path.exists():
             stem = save_path.stem
             suffix = save_path.suffix
@@ -1071,7 +1081,7 @@ async def download_document_at_row(
 
 
 async def navigate_home(page):
-    """Click the Home icon to return to the Content Server home page."""
+    """Click the Home icon to return to Content Server home page."""
     await click_with_fallback(
         page,
         [
@@ -1086,61 +1096,52 @@ async def navigate_home(page):
     await page.wait_for_timeout(3000)
 
 
-async def download_ff_for_employee(
+async def download_prejoining_for_employee(
     page, employee_number: str, download_dir: Path
 ) -> Tuple[str, List[str]]:
     """
-    Full flow to download all F&F documents for one employee:
+    Full flow to download all Pre-Joining/Talent Acquisition documents for one employee:
       1. Search by employee number
-      2. Click first search result
-      3. Click "Adani Exit Documents" folder
-      4. Download each document
+      2. Click employee master folder
+      3. Click 'Pre Joining and Talent Acquisition Stage' folder
+      4. Download each matching document
       5. Navigate back home
-
-    Returns a tuple of (status, downloaded_file_paths):
-      - (STATUS_DOWNLOADED, [paths])  -- F&F files were found and saved.
-      - (STATUS_NO_FF_DOCS, [])       -- Folder found, but no F&F sheet uploaded.
-      - (STATUS_NOT_FOUND, [])        -- Content Server returned 0 search hits.
-      - (STATUS_ERROR, [])            -- Search timeout, network failure, etc.
     """
     downloaded_files = []
     emp_dir = None
-    status = STATUS_ERROR  # Default; overridden on success
+    status = STATUS_ERROR
 
     try:
-        # Step 1: Search
+        # Step 1: Search employee
         await search_employee(page, employee_number)
 
-        # Step 2: Click the exact employee folder matching the ID
+        # Step 2: Click employee master folder
         await click_employee_master_folder(page, employee_number)
 
-        # Step 3: Navigate into "Adani Exit Documents"
+        # Step 3: Navigate into "Pre Joining and Talent Acquisition Stage"
         try:
-            await click_adani_exit_documents(page, employee_number)
+            await click_prejoining_folder(page, employee_number)
         except RuntimeError as e:
-            if "Employee folder table did not load" in str(e) or "Adani Exit Documents" in str(e):
-                print(f"[{ts()}] [WARN] Failed to load folder table or find Adani Exit Documents. Clicking Home and retrying once...")
+            if "table did not load" in str(e).lower() or "pre joining" in str(e).lower():
+                print(f"[{ts()}] [WARN] Folder load failed. Clicking Home and retrying once...")
                 await navigate_home(page)
                 await page.wait_for_timeout(3000)
                 await search_employee(page, employee_number)
                 await click_employee_master_folder(page, employee_number)
-                await click_adani_exit_documents(page, employee_number)
+                await click_prejoining_folder(page, employee_number)
             else:
                 raise
 
-        # Step 4: Get document count and download each
+        # Step 4: Get document count and download matching files
         doc_count = await get_document_count(page)
 
         if doc_count == 0:
-            print(f"[{ts()}]   No documents found for employee {employee_number}")
-            status = STATUS_NO_FF_DOCS
+            print(f"[{ts()}]   No documents found in Pre-Joining folder for employee {employee_number}")
+            status = STATUS_NO_DOCS
         else:
-            # Define the subfolder path, but do NOT create it yet.
-            # It will be created in download_document_at_row ONLY if a valid document is found.
             emp_dir = download_dir / employee_number
 
             for row_idx in range(1, doc_count + 1):
-                # Check for error dialogs between downloads (server may show errors under load)
                 await check_and_dismiss_error_dialog(page)
 
                 result = await download_document_at_row(
@@ -1148,16 +1149,14 @@ async def download_ff_for_employee(
                 )
                 if result:
                     downloaded_files.append(result)
-                # Small delay between downloads
                 await page.wait_for_timeout(2000)
 
-            # Folder was found and iterated -- set status based on whether any F&F file existed
             if downloaded_files:
                 status = STATUS_DOWNLOADED
             else:
-                # Documents existed (e.g. Resignation Letter, NDC Form) but none matched F&F
-                status = STATUS_NO_FF_DOCS
+                status = STATUS_NO_DOCS
 
+        # Clean up any leftover error screenshots since processing succeeded
         cleanup_error_screenshots(employee_number)
 
     except RuntimeError as e:
@@ -1178,46 +1177,148 @@ async def download_ff_for_employee(
     return status, downloaded_files
 
 
-# ─── MAIN ────────────────────────────────────────────────────────────────────
+# ==== MAIN ====
+
+def load_employee_ids_from_file(file_path: Path) -> List[str]:
+    """
+    Read an Excel (.xlsx, .xls, .xlsm) or CSV file and extract employee IDs.
+    Looks for column names like 'Employee Code', 'Employee ID', 'Emp Code', etc.
+    If no matching column header is found, defaults to the first column.
+    """
+    ext = file_path.suffix.lower()
+    if ext in [".xlsx", ".xlsm"]:
+        df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
+    elif ext == ".xls":
+        df = pd.read_excel(file_path, dtype=str)
+    elif ext == ".csv":
+        df = pd.read_csv(file_path, dtype=str)
+    else:
+        raise ValueError(f"Unsupported file format '{ext}'. Please provide a .xlsx, .xls, or .csv file.")
+
+    if df.empty:
+        return []
+
+    # Find matching employee column
+    target_col = None
+    priority_patterns = [
+        r"employee[_\s\-]*code",
+        r"emp[_\s\-]*code",
+        r"employee[_\s\-]*id",
+        r"emp[_\s\-]*id",
+        r"employee[_\s\-]*no",
+        r"employee[_\s\-]*number",
+        r"emp[_\s\-]*no",
+        r"user[_\s\-]*id",
+        r"perner",
+        r"id",
+    ]
+
+    for pat in priority_patterns:
+        for col in df.columns:
+            if re.search(pat, str(col).strip(), re.IGNORECASE):
+                target_col = col
+                break
+        if target_col:
+            break
+
+    # If no matching column header found, default to the first column
+    if not target_col:
+        target_col = df.columns[0]
+        print(f"[{ts()}] No explicit 'Employee Code' header found; using first column: '{target_col}'")
+    else:
+        print(f"[{ts()}] Identified employee column: '{target_col}'")
+
+    ids = []
+    seen = set()
+    for val in df[target_col].dropna():
+        clean_val = str(val).strip()
+        # If float string like '10002440.0', strip '.0'
+        if clean_val.endswith(".0"):
+            clean_val = clean_val[:-2]
+        clean_val = clean_val.strip()
+        if clean_val and clean_val.lower() != "nan" and clean_val not in seen:
+            seen.add(clean_val)
+            ids.append(clean_val)
+
+    return ids
+
 
 def prompt_employee_numbers() -> List[str]:
     """
-    Interactive terminal prompt -- collects employee ID(s) from the user on a single line.
-    Strips any unwanted leading and trailing whitespaces.
+    Interactive terminal prompt to collect employee ID(s).
+    Supports:
+      1. Path to an Excel/CSV file containing 'Employee Code' column (e.g. C:\\path\\to\\employees.xlsx)
+      2. Direct manual IDs: comma/space-separated (e.g. 10002394, 10002440)
+      3. Press Enter without typing to retry failed screenshots if present.
     """
-    # Use the raw terminal stream so the prompt is visible even with LoggerWriter
     terminal = sys.__stdout__
 
     terminal.write("\n")
-    terminal.write("  ╔═══════════════════════════════════════════════════════╗\n")
-    terminal.write("  ║        F&F Exit Document Downloader                  ║\n")
-    terminal.write("  ╚═══════════════════════════════════════════════════════╝\n")
+    terminal.write("  ╔══════════════════════════════════════════════════════════════════════╗\n")
+    terminal.write("  ║       Pre-Joining & Talent Acquisition Document Downloader           ║\n")
+    terminal.write("  ╚══════════════════════════════════════════════════════════════════════╝\n")
     terminal.write("\n")
     terminal.flush()
 
+    failed_in_folder = get_failed_ids_from_error_folder()
+    if failed_in_folder:
+        terminal.write(f"  [NOTE] {len(failed_in_folder)} failed employee screenshot(s) found in errors/prejoining_error/:\n")
+        terminal.write(f"         {', '.join(failed_in_folder[:15])}{'...' if len(failed_in_folder) > 15 else ''}\n")
+        terminal.write("         (Press Enter without typing to automatically retry these failed employees)\n\n")
+        terminal.flush()
+
     try:
-        terminal.write("  Enter Employee ID (or multiple comma-separated): ")
+        terminal.write("  Enter Excel/CSV file path OR Employee ID(s): ")
         terminal.flush()
         raw = sys.__stdin__.readline()
     except (EOFError, KeyboardInterrupt):
         terminal.write("\n")
         return []
 
-    # Strip leading/trailing whitespaces from the whole input line
-    raw = raw.strip()
+    raw = raw.strip().strip("'\"")
     if not raw:
-        terminal.write("\n  -> No employee numbers entered.\n\n")
+        if failed_in_folder:
+            terminal.write(f"\n  -> Retrying {len(failed_in_folder)} failed employee(s) from error folder: {', '.join(failed_in_folder)}\n\n")
+            terminal.flush()
+            return failed_in_folder
+        terminal.write("\n  -> No input entered.\n\n")
         terminal.flush()
         return []
 
-    # Split by comma or whitespace, and strip each individual token
+    # Check if user entered an Excel/CSV file path (supports full path OR relative path)
+    possible_path = Path(raw)
+    if not possible_path.exists():
+        # Check relative to project root directory
+        alt_path = ROOT_DIR / raw
+        if alt_path.exists():
+            possible_path = alt_path
+
+    if possible_path.exists() and possible_path.suffix.lower() in [".xlsx", ".xls", ".xlsm", ".csv"]:
+        try:
+            terminal.write(f"\n  -> Reading employee codes from file: {possible_path.name}...\n")
+            terminal.flush()
+            extracted_ids = load_employee_ids_from_file(possible_path)
+            if extracted_ids:
+                terminal.write(f"  -> Successfully loaded {len(extracted_ids):,} unique employee ID(s) from {possible_path.name}!\n")
+                terminal.write(f"  -> Sample: {', '.join(extracted_ids[:8])}{'...' if len(extracted_ids) > 8 else ''}\n\n")
+                terminal.flush()
+                return extracted_ids
+            else:
+                terminal.write(f"  [WARN] No valid employee IDs found in {possible_path.name}.\n\n")
+                terminal.flush()
+                return []
+        except Exception as e:
+            terminal.write(f"  [ERROR] Failed to read file {possible_path.name}: {e}\n\n")
+            terminal.flush()
+            return []
+
+    # Otherwise, parse manual IDs
     collected = []
     for token in raw.replace(",", " ").split():
-        token = token.strip()
+        token = token.strip().strip("'\"")
         if token:
             collected.append(token)
 
-    # De-duplicate while preserving order
     seen = set()
     unique = []
     for num in collected:
@@ -1226,7 +1327,7 @@ def prompt_employee_numbers() -> List[str]:
             unique.append(num)
 
     if unique:
-        terminal.write(f"\n  -> {len(unique)} employee(s) queued: {', '.join(unique)}\n\n")
+        terminal.write(f"\n  -> {len(unique):,} employee(s) queued: {', '.join(unique[:10])}{'...' if len(unique) > 10 else ''}\n\n")
         terminal.flush()
     else:
         terminal.write("\n  -> No employee numbers entered.\n\n")
@@ -1235,17 +1336,12 @@ def prompt_employee_numbers() -> List[str]:
     return unique
 
 
-async def download_ff_reports(employee_numbers: List[str], upload_callback=None):
+async def download_prejoining_reports(employee_numbers: List[str], upload_callback=None):
     """
-    Main entry point. Downloads F&F exit documents for one or more employees.
+    Main entry point. Downloads Pre-Joining and Talent Acquisition documents for one or more employees.
     Uses concurrent browser tabs (up to MAX_CONCURRENT_TABS) for parallel processing.
-    After the primary batch, automatically retries employees that had search/network
-    errors (STATUS_ERROR) with lower concurrency for reliability.
-
-    Args:
-        employee_numbers: List of employee numbers to process.
-        upload_callback:  Optional async callback(emp_num, file_list) for uploading.
     """
+    setup_logger("download_prejoining_report.log")
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
     if not employee_numbers:
@@ -1253,29 +1349,25 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
         return
 
     if not CONTENT_SERVER_URL:
-        print(f"[{ts()}] [FATAL ERROR] CONTENT_SERVER_URL is completely blank in your .env file!")
-        print(f"[{ts()}] Please open the .env file and add the URL like: CONTENT_SERVER_URL=https://...")
+        print(f"[{ts()}] [FATAL ERROR] CONTENT_SERVER_URL is blank in your .env file!")
+        print(f"[{ts()}] Please open .env and add: CONTENT_SERVER_URL=https://...")
         return
 
     concurrency = min(MAX_CONCURRENT_TABS, len(employee_numbers))
-    print(f"[{ts()}] Starting F&F report download ({'headless' if HEADLESS == 'true' else 'visible'})")
+    print(f"[{ts()}] Starting Pre-Joining document download ({'headless' if HEADLESS == 'true' else 'visible'})")
     print(f"[{ts()}] Concurrency: {concurrency} tab(s) for {len(employee_numbers)} employee(s)")
 
     _cleanup_profile_locks()
 
-    # Structured results: emp_num -> (status, [file_paths])
     all_results: Dict[str, Tuple[str, List[str]]] = {}
+    master_records: Dict[str, Dict[str, str]] = _load_existing_master_excel()
+    excel_lock = asyncio.Lock()
 
     async def _run_batch(
         p_context, emp_list: List[str], num_tabs: int,
         nav_lock: asyncio.Lock, total_label: int, start_offset: int = 0,
         upload_cb=None,
     ):
-        """
-        Process a list of employees using the given browser context and tab count.
-        Updates all_results in-place.
-        """
-        # Pre-create worker tabs (reuse first page for tab 1)
         first_page = p_context.pages[0] if p_context.pages else await p_context.new_page()
         worker_pages = [first_page]
         for i in range(1, num_tabs):
@@ -1292,11 +1384,9 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
         print(f"[{ts()}] {actual_tabs} tab(s) ready. Starting downloads...\n")
 
         async def _worker(worker_page, emp_num: str, idx: int):
-            """Process a single employee in its own browser tab."""
             try:
                 print(f"[{ts()}] ── [Tab] Employee {idx}/{total_label}: {emp_num} ──")
 
-                # Navigate to Content Server home (serialised via lock)
                 nav_success = False
                 for nav_attempt in range(2):
                     try:
@@ -1322,11 +1412,14 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
                 if not nav_success:
                     raise RuntimeError(f"Could not navigate to Content Server for {emp_num}")
 
-                # Download F&F docs for this employee
-                status, downloaded = await download_ff_for_employee(
+                status, downloaded = await download_prejoining_for_employee(
                     worker_page, emp_num, DOWNLOAD_DIR
                 )
                 all_results[emp_num] = (status, downloaded)
+
+                # Real-time Master Excel live write immediately after each employee finishes
+                async with excel_lock:
+                    _record_employee_to_master_excel(master_records, emp_num, status, downloaded)
 
                 if downloaded and upload_cb:
                     try:
@@ -1337,10 +1430,10 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
 
             except Exception as e:
                 print(f"[{ts()}] [Tab] Error for {emp_num}: {e}")
-                await save_debug_screenshot(worker_page, "error", emp_num)
                 all_results[emp_num] = (STATUS_ERROR, [])
+                async with excel_lock:
+                    _record_employee_to_master_excel(master_records, emp_num, STATUS_ERROR, [])
 
-        # Process employees in batches matching available tabs
         for batch_start in range(0, len(emp_list), actual_tabs):
             batch = emp_list[batch_start : batch_start + actual_tabs]
             batch_tasks = []
@@ -1350,11 +1443,8 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
                 batch_tasks.append(_worker(page, emp_num, idx))
 
             await asyncio.gather(*batch_tasks)
-
-            # Small staggered delay between batches to avoid overwhelming Content Server
             await asyncio.sleep(1.5)
 
-        # Close extra tabs (keep first page for potential retry reuse)
         for wp in worker_pages[1:]:
             try:
                 await wp.close()
@@ -1370,20 +1460,28 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
                 "--disable-blink-features=AutomationControlled",
                 "--disable-session-crashed-bubble",
                 "--hide-crash-restore-bubble",
-                "--window-size=1517,900",
-                "--window-position=-32000,-32000",
             ]
             is_headless = HEADLESS == "true"
+            if is_headless:
+                launch_kwargs = {
+                    "headless": True,
+                    "viewport": {"width": 1920, "height": 1080},
+                }
+            else:
+                chrome_args.append("--start-maximized")
+                launch_kwargs = {
+                    "headless": False,
+                    "no_viewport": True,
+                }
 
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=str(AUTOMATION_PROFILE_DIR),
-                # channel="chrome",
-                headless=is_headless,
-                accept_downloads=True,
                 args=chrome_args,
+                accept_downloads=True,
+                **launch_kwargs,
             )
 
-            # ── Step 1: Establish login / SSO on the first tab ────────────
+            # Establish login / SSO on the first tab
             first_page = context.pages[0] if context.pages else await context.new_page()
 
             print(f"[{ts()}] Navigating to Content Server...")
@@ -1398,16 +1496,14 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
 
             nav_lock = asyncio.Lock()
 
-            # ── Step 2: Primary batch ─────────────────────────────────────
+            # Primary batch
             await _run_batch(
                 context, employee_numbers, concurrency,
                 nav_lock, len(employee_numbers),
                 upload_cb=upload_callback,
             )
 
-            # -- Step 3: Retry loop -- keep retrying until errors/ff_error/ is empty --
-            # In Round 1, also retry any employees that received "0 hits" during the primary batch,
-            # ensuring that temporary Content Server lag does not produce false negatives.
+            # ==== Retry loop: retry error screenshots AND initial 0-hits ====
             MAX_RETRY_ROUNDS = 5
             initial_not_found = [
                 emp for emp, (st, _) in all_results.items() if st == STATUS_NOT_FOUND
@@ -1416,7 +1512,7 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
             for retry_round in range(1, MAX_RETRY_ROUNDS + 1):
                 folder_failed_ids = get_failed_ids_from_error_folder()
 
-                # In Round 1, include initial 0-hits so they are given a stable retry with 2 tabs
+                # In Round 1, also include 0-hits from primary batch so they are given a stable retry with 2 tabs
                 if retry_round == 1 and initial_not_found:
                     combined_ids = list(folder_failed_ids)
                     for nf_id in initial_not_found:
@@ -1427,10 +1523,10 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
                     current_retry_ids = folder_failed_ids
 
                 if not current_retry_ids:
-                    print(f"[{ts()}] errors/ff_error/ is empty -- no retries needed.")
+                    print(f"[{ts()}] errors/prejoining_error/ is empty -- no retries needed.")
                     break
 
-                retry_concurrency = min(2, len(current_retry_ids))  # Lower concurrency for stability
+                retry_concurrency = min(2, len(current_retry_ids))
                 print()
                 print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
                 print(f"[{ts()}] RETRY ROUND {retry_round}/{MAX_RETRY_ROUNDS}: {len(current_retry_ids)} employee(s) queued for retry")
@@ -1439,7 +1535,6 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
                 print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
                 print()
 
-                # Navigate first page back home before retry
                 try:
                     remaining_pages = context.pages
                     if remaining_pages:
@@ -1458,7 +1553,6 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
                     upload_cb=upload_callback,
                 )
 
-                # Clean up error screenshots for employees that succeeded on retry
                 resolved_count = 0
                 for emp_num in current_retry_ids:
                     retry_status, _ = all_results.get(emp_num, (STATUS_ERROR, []))
@@ -1469,17 +1563,15 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
 
                 print(f"[{ts()}]   Round {retry_round} complete: {resolved_count}/{len(current_retry_ids)} resolved")
 
-                # Check if error folder is now empty
                 remaining = get_failed_ids_from_error_folder()
                 if not remaining:
-                    print(f"[{ts()}] errors/ff_error/ is now empty -- all retries succeeded!")
+                    print(f"[{ts()}] errors/prejoining_error/ is now empty -- all retries succeeded!")
                     break
                 elif retry_round < MAX_RETRY_ROUNDS:
                     print(f"[{ts()}]   {len(remaining)} still remaining, will retry next round...")
                 else:
                     print(f"[{ts()}]   {len(remaining)} still remaining after {MAX_RETRY_ROUNDS} retry rounds.")
 
-            # ── Close browser ─────────────────────────────────────────────
             for pg in context.pages:
                 try:
                     await pg.close()
@@ -1493,14 +1585,14 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
     except Exception as e:
         print(f"[{ts()}] FATAL: {e}\n{traceback.format_exc()}")
 
-    # ── Categorized Summary ───────────────────────────────────────────────────
     _print_categorized_summary(all_results)
+    _generate_excel_summary(all_results)
 
 
 def _print_categorized_summary(all_results: Dict[str, Tuple[str, List[str]]]):
     """Print a clear, categorized download summary."""
     downloaded = {k: v for k, (s, v) in all_results.items() if s == STATUS_DOWNLOADED}
-    no_ff      = {k: v for k, (s, v) in all_results.items() if s == STATUS_NO_FF_DOCS}
+    no_docs    = {k: v for k, (s, v) in all_results.items() if s == STATUS_NO_DOCS}
     not_found  = {k: v for k, (s, v) in all_results.items() if s == STATUS_NOT_FOUND}
     errors     = {k: v for k, (s, v) in all_results.items() if s == STATUS_ERROR}
 
@@ -1509,7 +1601,7 @@ def _print_categorized_summary(all_results: Dict[str, Tuple[str, List[str]]]):
 
     print()
     print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
-    print(f"[{ts()}] DOWNLOAD SUMMARY")
+    print(f"[{ts()}] PRE-JOINING DOWNLOAD SUMMARY")
     print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
 
     if downloaded:
@@ -1518,10 +1610,10 @@ def _print_categorized_summary(all_results: Dict[str, Tuple[str, List[str]]]):
         for emp, files in downloaded.items():
             print(f"[{ts()}]      {emp}: {len(files)} file(s)")
 
-    if no_ff:
+    if no_docs:
         print(f"[{ts()}]")
-        print(f"[{ts()}]   [INFO] NO F&F DOCUMENT ({len(no_ff)} employee(s) -- folder found, no F&F sheet uploaded):")
-        for emp in no_ff:
+        print(f"[{ts()}]   [INFO] NO MATCHING PRE-JOINING DOCUMENTS ({len(no_docs)} employee(s) -- folder found, no matching document uploaded):")
+        for emp in no_docs:
             print(f"[{ts()}]      {emp}")
 
     if not_found:
@@ -1539,13 +1631,127 @@ def _print_categorized_summary(all_results: Dict[str, Tuple[str, List[str]]]):
     print(f"[{ts()}] ───────────────────────────────────────────────────────────")
     print(f"[{ts()}]   Total: {total_files} file(s) downloaded for {total_emps} employee(s)")
     if errors:
-        print(f"[{ts()}]   [WARN] {len(errors)} employee(s) still have unresolved errors -- check errors/ff_error/ for screenshots")
+        print(f"[{ts()}]   [WARN] {len(errors)} employee(s) still have unresolved errors -- check errors/prejoining_error/ for screenshots")
     print(f"[{ts()}] ═══════════════════════════════════════════════════════════")
+
+
+def _load_existing_master_excel() -> Dict[str, Dict[str, str]]:
+    """Load existing records from Master_Pre_Joining_Summary.xlsx if it exists."""
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    if not MASTER_EXCEL_PATH.exists():
+        return {}
+
+    try:
+        df = pd.read_excel(str(MASTER_EXCEL_PATH), sheet_name="Master_Summary", dtype={"Employee ID": str})
+        records = {}
+        for _, row in df.iterrows():
+            eid = str(row.get("Employee ID", "")).strip()
+            if eid and eid != "nan":
+                records[eid] = {
+                    "Employee ID": eid,
+                    "Offer Letter": str(row.get("Offer Letter", "No")).strip(),
+                    "Background Verification": str(row.get("Background Verification", "No")).strip(),
+                    "Appointment Letter": str(row.get("Appointment Letter", "No")).strip(),
+                }
+        print(f"[{ts()}] Loaded {len(records):,} existing employee record(s) from Master Excel.")
+        return records
+    except Exception as e:
+        print(f"[{ts()}] [WARN] Could not read existing Master Excel ({e}). A fresh one will be started.")
+        return {}
+
+
+def _record_employee_to_master_excel(
+    master_records: Dict[str, Dict[str, str]],
+    emp_id: str,
+    status: str,
+    file_paths: List[str]
+):
+    """
+    Update a single employee in master_records and write to Master_Pre_Joining_Summary.xlsx immediately in real time.
+    """
+    emp_str = str(emp_id).strip()
+    has_offer = "No"
+    has_bgv = "No"
+    has_appointment = "No"
+
+    prev = master_records.get(emp_str, {})
+
+    for fpath in file_paths:
+        fname = Path(fpath).name
+        categories = _classify_document(fname)
+        if "Offer Letter" in categories:
+            has_offer = "Yes"
+        if "Background Verification" in categories:
+            has_bgv = "Yes"
+        if "Appointment Letter" in categories:
+            has_appointment = "Yes"
+
+    # Retain prior "Yes" if already found in a past run
+    if has_offer == "No" and prev.get("Offer Letter") == "Yes":
+        has_offer = "Yes"
+    if has_bgv == "No" and prev.get("Background Verification") == "Yes":
+        has_bgv = "Yes"
+    if has_appointment == "No" and prev.get("Appointment Letter") == "Yes":
+        has_appointment = "Yes"
+
+    master_records[emp_str] = {
+        "Employee ID": emp_str,
+        "Offer Letter": has_offer,
+        "Background Verification": has_bgv,
+        "Appointment Letter": has_appointment,
+    }
+
+    # Save immediately to disk
+    try:
+        df = pd.DataFrame(list(master_records.values()))
+        cols = ["Employee ID", "Offer Letter", "Background Verification", "Appointment Letter"]
+        df = df.reindex(columns=cols)
+
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(str(MASTER_EXCEL_PATH), engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Master_Summary")
+
+            worksheet = writer.sheets["Master_Summary"]
+            for col_idx, col_name in enumerate(df.columns, start=1):
+                max_len = max(
+                    len(str(col_name)),
+                    df[col_name].astype(str).str.len().max()
+                )
+                col_letter = worksheet.cell(row=1, column=col_idx).column_letter
+                worksheet.column_dimensions[col_letter].width = max(max_len + 5, 16)
+
+        print(f"[{ts()}]   [Master Excel Live] {emp_str} -> Offer: {has_offer} | BGV: {has_bgv} | Appointment: {has_appointment} ({len(master_records)} total in master)")
+    except Exception as e:
+        print(f"[{ts()}]   [ERROR] Failed real-time Master Excel write for {emp_str}: {e}")
+
+
+def _generate_excel_summary(all_results: Dict[str, Tuple[str, List[str]]]):
+    """Final check and confirmation of Master Excel file."""
+    if MASTER_EXCEL_PATH.exists():
+        try:
+            df = pd.read_excel(str(MASTER_EXCEL_PATH), sheet_name="Master_Summary", dtype=str)
+            print(f"[{ts()}] Final Master Excel verified: {MASTER_EXCEL_PATH} ({len(df):,} total employee(s))")
+        except Exception:
+            pass
+
+    # Push directly to SharePoint
+    try:
+        print(f"[{ts()}] Pushing Pre-Joining reports directly to SharePoint...")
+        async def _upload_to_sp():
+            async with sp_uploader.httpx.AsyncClient(verify=False) as client:
+                site_id = await sp_uploader.get_site_id(client)
+                drive_id, folder_path = await sp_uploader.get_drive_details(client, site_id)
+                await sp_uploader.upload_prejoining_reports(client, site_id, drive_id, folder_path)
+                print(f"[{ts()}] Pre-Joining SharePoint sync completed successfully.")
+        asyncio.run(_upload_to_sp())
+    except Exception as sp_err:
+        print(f"[{ts()}] [WARNING] SharePoint upload failed: {sp_err}")
 
 
 if __name__ == "__main__":
     numbers = prompt_employee_numbers()
     if numbers:
-        asyncio.run(download_ff_reports(numbers))
+        asyncio.run(download_prejoining_reports(numbers))
     else:
         print("No employee numbers entered. Exiting.")
+

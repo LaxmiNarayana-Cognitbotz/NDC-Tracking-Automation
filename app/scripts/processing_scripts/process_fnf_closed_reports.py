@@ -2,86 +2,52 @@
 Downloads F&F report from Sharepoint, runs F&F extraction, and uploads results.
 """
 
+import sys
+from pathlib import Path
+
+# Add project root to sys.path so the script can be run directly or via VS Code Run
+ROOT_DIR = Path(__file__).resolve().parents[3]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 import asyncio
 import importlib
-import os
-import sys
 import traceback
-from pathlib import Path
-
-# Add project root to sys.path so we can import from scripts.*
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-import urllib.parse
 from datetime import datetime
-from pathlib import Path
 
 import httpx
 import pandas as pd
 from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv(verbose=True)
-
-from scripts.upload_to_sharepoint import (
-    get_access_token,
-    get_site_id,
-    get_drive_details,
+from app.core.config import UPLOADS_DIR
+from app.core.logger import setup_logger
+from app.scripts.processing_scripts.upload_to_sharepoint import (
+    FF_REPORTS_DIR,
     encode_path_segments,
-    TARGET_FOLDER,
+    get_access_token,
+    get_drive_details,
+    get_site_id,
     upload_file,
-    FF_REPORTS_DIR
 )
 
 # Dynamically import the module since it contains an ampersand
-download_module = importlib.import_module("scripts.download_f&f_report")
+download_module = importlib.import_module("app.scripts.automation_scripts.download_f&f_report")
 download_ff_reports = download_module.download_ff_reports
 
-# ── Logging Setup ────────────────────────────────────────────────────────────
-LOG_DIR = Path(__file__).parent.parent / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "process_fnf_closed_reports.log"
+# Load environment variables
+load_dotenv(verbose=True)
 
-class LoggerWriter:
-    def __init__(self, file_path):
-        self.terminal = sys.stdout
-        self.file_path = file_path
+# ==== Logging Setup ====
+LOG_FILE = setup_logger("process_fnf_closed_reports.log")
 
-    def write(self, message):
-        try:
-            with open(self.file_path, "a", encoding="utf-8") as f:
-                f.write(message)
-        except Exception:
-            pass
-        if self.terminal is not None:
-            try:
-                self.terminal.write(message)
-            except UnicodeEncodeError:
-                try:
-                    self.terminal.write(message.encode("cp1252", errors="replace").decode("cp1252"))
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-    def flush(self):
-        if self.terminal is not None:
-            try:
-                self.terminal.flush()
-            except Exception:
-                pass
-
-sys.stdout = LoggerWriter(LOG_FILE)
-sys.stderr = LoggerWriter(LOG_FILE)
-
-UPLOADS_DIR = Path(__file__).parent.parent / "uploads"
 LOCAL_EXCEL_DIR = UPLOADS_DIR / "FNF_Active_Reports"
-LOCAL_EXCEL_DIR.mkdir(parents=True, exist_ok=True)
 
 def ts():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 async def process_fnf_active_reports():
+    setup_logger("process_fnf_closed_reports.log")
+    LOCAL_EXCEL_DIR.mkdir(parents=True, exist_ok=True)
     print(f"[{ts()}] Starting F&F Active Reports processing...")
     
 
@@ -94,7 +60,7 @@ async def process_fnf_active_reports():
             token = await get_access_token()
             headers = {"Authorization": f"Bearer {token}"}
             
-            # 1. List files in the F&F_Active_Report folder
+            # ==== List files in the F&F_Active_Report folder ====
             # The folder_path returned by get_drive_details is relative to the Drive root.
             fnf_folder_in_drive = f"{folder_path}/F&F_Active_Report".strip("/")
             encoded_path = encode_path_segments(fnf_folder_in_drive)
@@ -140,7 +106,7 @@ async def process_fnf_active_reports():
                 
                 print(f"[{ts()}] Successfully downloaded '{file_name}'. Extracting Person Numbers...")
                 
-                # 2. Read the Excel file and extract IDs
+                # ==== Read the Excel file and extract IDs ====
                 try:
                     df = pd.read_excel(local_file_path)
                     # Support 'Person Number' or 'Employee ID' variations
@@ -167,7 +133,7 @@ async def process_fnf_active_reports():
                         print(f"[{ts()}] No valid employee IDs found in {file_name}.")
                         continue
                         
-                    # 3. Define the upload callback for parallel upload
+                    # ==== Define the upload callback for parallel upload ====
                     target_base_url = f"{folder_path}/F&F_Documents"
                     
                     async def on_employee_downloaded(emp_id: str, downloaded_paths: list):
@@ -190,11 +156,11 @@ async def process_fnf_active_reports():
                             except:
                                 pass
 
-                    # 4. Call the F&F download script with the callback
+                    # ==== Call the F&F download script with the callback ====
                     print(f"[{ts()}] Initiating F&F document download for {len(unique_employees)} employee(s)...")
                     await download_ff_reports(unique_employees, upload_callback=on_employee_downloaded)
                     
-                    # 5. Clean up local Excel file
+                    # ==== Clean up local Excel file ====
                     if local_file_path.exists():
                         local_file_path.unlink()
                         print(f"[{ts()}] [CLEANUP] Deleted local Excel file: {file_name}")

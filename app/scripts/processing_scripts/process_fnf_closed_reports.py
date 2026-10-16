@@ -3,6 +3,7 @@ Downloads F&F report from Sharepoint, runs F&F extraction, and uploads results.
 """
 
 import sys
+import os
 from pathlib import Path
 
 # Add project root to sys.path so the script can be run directly or via VS Code Run
@@ -56,7 +57,8 @@ async def process_fnf_active_reports():
         try:
             print(f"[{ts()}] Connecting to SharePoint...")
             site_id = await get_site_id(client)
-            drive_id, folder_path = await get_drive_details(client, site_id)
+            target_sp = os.getenv("SHAREPOINT_TARGET_FOLDER")
+            drive_id, folder_path = await get_drive_details(client, site_id, target_sp)
             token = await get_access_token()
             headers = {"Authorization": f"Bearer {token}"}
             

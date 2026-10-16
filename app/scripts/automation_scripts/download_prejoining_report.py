@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 import app.scripts.processing_scripts.upload_to_sharepoint as sp_uploader
+from app.helpers.auth import MicrosoftSSOHandler
 from app.core.config import (
     AUTOMATION_PROFILE_DIR,
     PREJOINING_ERRORS_DIR,
@@ -227,211 +228,16 @@ async def check_and_dismiss_error_dialog(page) -> bool:
 
 # ==== SSO Handling ====
 
-async def check_for_sso_errors(page):
-    """Check if Microsoft SSO shows a validation error, and raise an exception if found."""
-    for error_id in ["usernameError", "passwordError", "error"]:
-        try:
-            loc = page.locator(f"#{error_id}").first
-            if await loc.is_visible(timeout=1000):
-                err_text = await loc.inner_text()
-                err_text = err_text.strip().replace("\n", " ")
-                if err_text:
-                    raise RuntimeError(f"Microsoft SSO Error: {err_text}")
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-
-    try:
-        alert_loc = page.locator('[role="alert"]').first
-        if await alert_loc.is_visible(timeout=1000):
-            text = (await alert_loc.inner_text()).strip().replace("\n", " ")
-            if text:
-                raise RuntimeError(f"Microsoft SSO Alert: {text}")
-    except RuntimeError:
-        raise
-    except Exception:
-        pass
+sso_handler = MicrosoftSSOHandler(
+    oracle_email=ORACLE_EMAIL or "",
+    oracle_password=ORACLE_PASSWORD or "",
+    error_dir=PREJOINING_ERRORS_DIR,
+)
 
 
-async def _handle_microsoft_sso(page):
-    """
-    Automatically fill the Microsoft SSO login form dynamically.
-    """
-    if not ORACLE_EMAIL or not ORACLE_PASSWORD:
-        print(f"[{ts()}] [WARN] No credentials in .env -- waiting for manual login...")
-        print(f"[{ts()}]   Create a .env file with ORACLE_EMAIL and ORACLE_PASSWORD")
-        return False
-
-    print(f"[{ts()}] SSO login detected -- filling credentials automatically...")
-
-    email_filled = False
-    password_filled = False
-    rsa_clicked = False
-
-    for iteration in range(15):
-        current_url = page.url.lower()
-        if not any(x in current_url for x in ["login.microsoftonline", "login.microsoft", "adfs", "saml"]):
-            print(f"[{ts()}]   SSO login completed -- redirected away from login screen.")
-            return True
-
-        # ==== Pick an account screen ====
-        if not email_filled and not password_filled:
-            try:
-                pick_header = page.locator('div#loginHeader:has-text("Pick an account"), div[role="heading"]:has-text("Pick an account")').first
-                if await pick_header.is_visible(timeout=1000):
-                    print(f"[{ts()}]   'Pick an account' screen detected.")
-                    target_email = ORACLE_EMAIL.strip().lower()
-                    account_found = False
-
-                    account_selectors = [
-                        'div.table[role="button"]',
-                        'div[data-test-id]',
-                        'div.row.tile',
-                        'li.table',
-                    ]
-                    for sel in account_selectors:
-                        try:
-                            accounts = page.locator(sel)
-                            count = await accounts.count()
-                            for i in range(count):
-                                tile = accounts.nth(i)
-                                tile_text = (await tile.inner_text()).strip().lower()
-                                if target_email in tile_text:
-                                    print(f"[{ts()}]   Found matching account tile: {ORACLE_EMAIL}")
-                                    await tile.click(force=True, timeout=5000)
-                                    account_found = True
-                                    break
-                            if account_found:
-                                break
-                        except Exception:
-                            continue
-
-                    if not account_found:
-                        try:
-                            el = page.locator(f'small:has-text("{ORACLE_EMAIL}"), div:has-text("{ORACLE_EMAIL}")').first
-                            if await el.is_visible(timeout=2000):
-                                parent = el.locator('xpath=ancestor::div[@role="button" or contains(@class,"table") or contains(@class,"tile")]').first
-                                if await parent.count() > 0:
-                                    await parent.click(force=True, timeout=5000)
-                                else:
-                                    await el.click(force=True, timeout=5000)
-                                account_found = True
-                                print(f"[{ts()}]   Clicked account tile via email text match: {ORACLE_EMAIL}")
-                        except Exception:
-                            pass
-
-                    if not account_found:
-                        try:
-                            use_another = page.locator('div#otherTile, div:has-text("Use another account")').last
-                            if await use_another.is_visible(timeout=3000):
-                                await use_another.click(force=True, timeout=5000)
-                                print(f"[{ts()}]   Account not in list -- clicked 'Use another account'")
-                        except Exception:
-                            print(f"[{ts()}]   Could not find matching account or 'Use another account' button")
-
-                    await page.wait_for_timeout(3000)
-                    continue
-            except Exception:
-                pass
-
-        # ==== Password input screen ====
-        if not password_filled:
-            try:
-                pw_input = page.locator('input[name="passwd"], input[id="i0118"], input[type="password"]').first
-                pw_indicator = page.locator('input[type="submit"][value="Sign in"], #idSIButton9[value="Sign in"], #idSIButton9:has-text("Sign in"), div:has-text("Enter password"), div:has-text("enter password"), #identityBanner, #idA_PWD_SwitchToCredPicker').first
-                if await pw_input.is_visible(timeout=1000) and (email_filled or await pw_indicator.is_visible(timeout=1000)):
-                    print(f"[{ts()}]   Password screen detected.")
-                    for attempt in range(1, 4):
-                        await pw_input.click(force=True, timeout=3000)
-                        await pw_input.fill("", force=True, timeout=3000)
-                        await page.wait_for_timeout(200)
-                        await pw_input.type(ORACLE_PASSWORD.strip(), delay=50)
-                        print(f"[{ts()}]   Entered password (Attempt {attempt}/3)")
-                        await page.wait_for_timeout(500)
-
-                        signin_btn = page.locator('input[type="submit"], #idSIButton9').first
-                        await signin_btn.click(force=True, timeout=5000)
-                        print(f"[{ts()}]   Clicked Sign In")
-                        await page.wait_for_timeout(3000)
-
-                        try:
-                            await check_for_sso_errors(page)
-                            password_filled = True
-                            email_filled = True
-                            break
-                        except RuntimeError as e:
-                            if attempt == 3:
-                                raise
-                            print(f"[{ts()}]   {e} - Retrying...")
-                    continue
-            except RuntimeError:
-                raise
-            except Exception:
-                pass
-
-        # ==== Email input screen ====
-        if not email_filled and not password_filled:
-            try:
-                email_input = page.locator('input[name="loginfmt"], input[type="email"], input[id="i0116"]').first
-                if await email_input.is_visible(timeout=1000):
-                    print(f"[{ts()}]   Email screen detected.")
-                    for attempt in range(1, 4):
-                        await email_input.click(force=True, timeout=3000)
-                        await email_input.fill("", force=True, timeout=3000)
-                        await page.wait_for_timeout(200)
-                        await email_input.type(ORACLE_EMAIL.strip(), delay=50)
-                        print(f"[{ts()}]   Entered email (Attempt {attempt}/3)")
-                        await page.wait_for_timeout(500)
-
-                        next_btn = page.locator('input[type="submit"], #idSIButton9').first
-                        await next_btn.click(force=True, timeout=5000)
-                        print(f"[{ts()}]   Clicked Next")
-                        await page.wait_for_timeout(3000)
-
-                        try:
-                            await check_for_sso_errors(page)
-                            email_filled = True
-                            break
-                        except RuntimeError as e:
-                            if attempt == 3:
-                                raise
-                            print(f"[{ts()}]   {e} - Retrying...")
-                    continue
-            except RuntimeError:
-                raise
-            except Exception:
-                pass
-
-        # ==== RSA / MFA Verify your identity screen ====
-        if not rsa_clicked:
-            try:
-                rsa_btn = page.locator('div[role="button"], button').filter(has_text="RSAEntraMFA").first
-                if await rsa_btn.is_visible(timeout=1500):
-                    print(f"[{ts()}]   'Verify your identity' screen detected.")
-                    await rsa_btn.click(force=True, timeout=5000)
-                    print(f"[{ts()}]   Clicked 'Approve with RSAEntraMFA'")
-                    await page.wait_for_timeout(3000)
-                    rsa_clicked = True
-                    break
-            except Exception:
-                pass
-
-        if password_filled:
-            break
-
-        await page.wait_for_timeout(1000)
-
-    print(f"[{ts()}] Waiting for RSA/MFA approval...")
-    print()
-    print("  +------------------------------------------------------------+")
-    print("  |  RSA push notification sent to the user's phone.           |")
-    print("  |  Please ask them to APPROVE it.                            |")
-    print("  |  Waiting up to 5 minutes...                                |")
-    print("  +------------------------------------------------------------+")
-    print()
-
-    return True
+async def _handle_microsoft_sso(page) -> bool:
+    """Automatically handle Microsoft SSO login dynamically using MicrosoftSSOHandler."""
+    return await sso_handler.authenticate(page, timeout_s=300)
 
 
 # ==== Helpers ====
@@ -474,39 +280,18 @@ async def wait_for_content_server_home(page, timeout_s: int = 300):
 
     while asyncio.get_event_loop().time() < deadline:
         current_url = page.url.lower()
-        if any(x in current_url for x in ["login.microsoftonline", "login.microsoft", "adfs", "saml"]):
-            if not login_handled:
-                login_handled = await _handle_microsoft_sso(page)
-
-        try:
-            if "securid.com" in current_url or "adani.auth" in current_url:
-                retry_btn = page.locator('button:has-text("Retry")').first
-                if await retry_btn.is_visible(timeout=1000):
-                    rsa_retry_count += 1
-                    print(f"[{ts()}] [WARN] RSA/MFA Authentication failed or rejected (Attempt {rsa_retry_count}/3).")
-                    if rsa_retry_count >= 3:
-                        await save_debug_screenshot(page, "rsa_failed")
-                        raise RuntimeError("RSA/MFA Authentication failed 3 times.")
-
-                    print(f"[{ts()}]   Clicking 'Retry' for RSA...")
-                    await retry_btn.click()
-                    await page.wait_for_timeout(3000)
-                    print(f"[{ts()}] Waiting for RSA/MFA approval...")
-                    continue
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-
-        try:
-            stay_signed = page.locator('#idSIButton9, input[value="Yes"]').first
-            if await stay_signed.is_visible(timeout=1000):
-                await stay_signed.click()
-                print(f"[{ts()}]   Clicked 'Stay signed in? -> Yes'")
-                await page.wait_for_timeout(3000)
-                continue
-        except Exception:
-            pass
+        if any(
+            x in current_url
+            for x in [
+                "login.microsoftonline",
+                "login.microsoft",
+                "adfs",
+                "saml",
+                "securid.com",
+                "adani.auth",
+            ]
+        ):
+            await sso_handler.authenticate(page, timeout_s=300)
 
         for sel in home_selectors:
             try:
@@ -1740,7 +1525,8 @@ def _generate_excel_summary(all_results: Dict[str, Tuple[str, List[str]]]):
         async def _upload_to_sp():
             async with sp_uploader.httpx.AsyncClient(verify=False) as client:
                 site_id = await sp_uploader.get_site_id(client)
-                drive_id, folder_path = await sp_uploader.get_drive_details(client, site_id)
+                target_sp = os.getenv("SHAREPOINT_TARGET_FOLDER")
+                drive_id, folder_path = await sp_uploader.get_drive_details(client, site_id, target_sp)
                 await sp_uploader.upload_prejoining_reports(client, site_id, drive_id, folder_path)
                 print(f"[{ts()}] Pre-Joining SharePoint sync completed successfully.")
         asyncio.run(_upload_to_sp())

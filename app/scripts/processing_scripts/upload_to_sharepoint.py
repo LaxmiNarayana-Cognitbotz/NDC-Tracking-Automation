@@ -101,7 +101,7 @@ async def get_site_id(client: httpx.AsyncClient) -> str:
     return _SITE_ID
 
 
-async def get_drive_details(client: httpx.AsyncClient, site_id: str) -> Tuple[str, str]:
+async def get_drive_details(client: httpx.AsyncClient, site_id: str, target_folder: Optional[str] = None) -> Tuple[str, str]:
     """Resolves the Drive ID and the base folder path inside that drive."""
     global _DRIVE_ID
 
@@ -110,7 +110,7 @@ async def get_drive_details(client: httpx.AsyncClient, site_id: str) -> Tuple[st
     site_path = parsed_site.path.rstrip("/")
     
     # Get normalized target folder relative to site path
-    folder = TARGET_FOLDER
+    folder = target_folder or TARGET_FOLDER or os.getenv("SHAREPOINT_TARGET_FOLDER") or ""
     if folder.startswith(site_path):
         folder = folder[len(site_path):]
     folder = folder.strip("/")

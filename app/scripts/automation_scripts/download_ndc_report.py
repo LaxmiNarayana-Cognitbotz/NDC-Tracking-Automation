@@ -331,7 +331,7 @@ class ReportPostFilter:
                         ignore_index=True,
                     )
                     if file_path.suffix.lower() == ".xls":
-                        final_df.to_excel(file_path, header=False, index=False)
+                        final_df.to_excel(file_path, header=False, index=False, engine="openpyxl")
                     else:
                         final_df.to_excel(file_path, header=False, index=False, engine="openpyxl")
                 else:
@@ -737,11 +737,22 @@ class NDCOracleReportDownloader:
                     # ==== Push directly to SharePoint ====
                     try:
                         print(f"[{AutomationUtils.ts()}] Pushing NDC report directly to SharePoint...")
+                        target_sp_folder = os.getenv("SHAREPOINT_TARGET_FOLDER")
+                        sp_uploader.TARGET_FOLDER = target_sp_folder
+                        sp_uploader._DRIVE_ID = None
                         async with sp_uploader.httpx.AsyncClient(verify=False) as client:
                             site_id = await sp_uploader.get_site_id(client)
-                            drive_id, folder_path = await sp_uploader.get_drive_details(client, site_id)
-                            await sp_uploader.upload_ndc_reports(client, site_id, drive_id, folder_path)
-                            print(f"[{AutomationUtils.ts()}] SharePoint sync completed successfully.")
+                            drive_id, folder_path = await sp_uploader.get_drive_details(client, site_id, target_sp_folder)
+                            target_folder_url = f"{folder_path}/NDC_Reports"
+
+                            await sp_uploader.cleanup_sharepoint_folder_files(client, site_id, drive_id, target_folder_url)
+                            local_file = Path(result)
+                            if local_file.exists():
+                                await sp_uploader.upload_file(client, site_id, drive_id, target_folder_url, local_file)
+                                print(f"[{AutomationUtils.ts()}] SharePoint sync completed successfully: {local_file.name}")
+                            else:
+                                await sp_uploader.upload_ndc_reports(client, site_id, drive_id, folder_path)
+                                print(f"[{AutomationUtils.ts()}] SharePoint sync completed successfully.")
                     except Exception as sp_err:
                         print(f"[{AutomationUtils.ts()}] [WARNING] SharePoint upload failed: {sp_err}\n{traceback.format_exc()}")
                 else:

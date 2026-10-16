@@ -1279,7 +1279,8 @@ async def download_ff_reports(employee_numbers: List[str], upload_callback=None)
             try:
                 async with sp_uploader.httpx.AsyncClient(verify=False) as client:
                     site_id = await sp_uploader.get_site_id(client)
-                    drive_id, folder_path = await sp_uploader.get_drive_details(client, site_id)
+                    target_sp = os.getenv("SHAREPOINT_TARGET_FOLDER")
+                    drive_id, folder_path = await sp_uploader.get_drive_details(client, site_id, target_sp)
                     emp_target_url = f"{folder_path}/F&F_Documents/{emp_id}"
                     for file_path_str in downloaded_paths:
                         f_path = Path(file_path_str)

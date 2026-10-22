@@ -26,7 +26,7 @@ from app.core.config import (
 )
 from app.core.logger import setup_logger
 
-load_dotenv(verbose=True)
+load_dotenv()
 
 # SharePoint Configurations
 TENANT_ID = os.getenv("SHAREPOINT_TENANT_ID")

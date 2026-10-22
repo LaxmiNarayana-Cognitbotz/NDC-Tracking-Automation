@@ -31,7 +31,7 @@ suppress_subprocess_window()
 # ==== Logger Setup ====
 LOG_FILE = setup_logger("download_elcm_report.log")
 
-load_dotenv(verbose=True)
+load_dotenv()
 
 
 # Application Configuration

@@ -13,6 +13,12 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import asyncio
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 import glob
 import os
 import re
@@ -37,7 +43,7 @@ from app.core.logger import setup_logger
 # ==== Logging Setup ====
 LOG_FILE = setup_logger("download_prejoining_report.log")
 
-load_dotenv(verbose=True)
+load_dotenv()
 
 # ==== Configuration ====
 
@@ -1371,7 +1377,7 @@ async def download_prejoining_reports(employee_numbers: List[str], upload_callba
         print(f"[{ts()}] FATAL: {e}\n{traceback.format_exc()}")
 
     _print_categorized_summary(all_results)
-    _generate_excel_summary(all_results)
+    await _generate_excel_summary(all_results)
 
 
 def _print_categorized_summary(all_results: Dict[str, Tuple[str, List[str]]]):
@@ -1510,7 +1516,7 @@ def _record_employee_to_master_excel(
         print(f"[{ts()}]   [ERROR] Failed real-time Master Excel write for {emp_str}: {e}")
 
 
-def _generate_excel_summary(all_results: Dict[str, Tuple[str, List[str]]]):
+async def _generate_excel_summary(all_results: Dict[str, Tuple[str, List[str]]]):
     """Final check and confirmation of Master Excel file."""
     if MASTER_EXCEL_PATH.exists():
         try:
@@ -1522,14 +1528,12 @@ def _generate_excel_summary(all_results: Dict[str, Tuple[str, List[str]]]):
     # Push directly to SharePoint
     try:
         print(f"[{ts()}] Pushing Pre-Joining reports directly to SharePoint...")
-        async def _upload_to_sp():
-            async with sp_uploader.httpx.AsyncClient(verify=False) as client:
-                site_id = await sp_uploader.get_site_id(client)
-                target_sp = os.getenv("SHAREPOINT_TARGET_FOLDER")
-                drive_id, folder_path = await sp_uploader.get_drive_details(client, site_id, target_sp)
-                await sp_uploader.upload_prejoining_reports(client, site_id, drive_id, folder_path)
-                print(f"[{ts()}] Pre-Joining SharePoint sync completed successfully.")
-        asyncio.run(_upload_to_sp())
+        async with sp_uploader.httpx.AsyncClient(verify=False) as client:
+            site_id = await sp_uploader.get_site_id(client)
+            target_sp = os.getenv("SHAREPOINT_TARGET_FOLDER", "")
+            drive_id, folder_path = await sp_uploader.get_drive_details(client, site_id, target_sp)
+            await sp_uploader.upload_prejoining_reports(client, site_id, drive_id, folder_path)
+            print(f"[{ts()}] Pre-Joining SharePoint sync completed successfully.")
     except Exception as sp_err:
         print(f"[{ts()}] [WARNING] SharePoint upload failed: {sp_err}")
 

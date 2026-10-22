@@ -20,7 +20,7 @@ from app.api.routes import router as automation_router
 from app.dto.schemas import HealthCheckResponse
 from app.services.automation_service import HealthService
 
-load_dotenv(verbose=True)
+load_dotenv()
 
 # Define explicit Proactor loop factory for Windows (required by Playwright when running under Uvicorn)
 def proactor_loop_factory(use_subprocess: bool = False):

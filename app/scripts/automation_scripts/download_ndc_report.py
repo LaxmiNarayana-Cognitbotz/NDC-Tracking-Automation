@@ -13,6 +13,12 @@ if str(ROOT_DIR) not in sys.path:
 import asyncio
 import os
 import traceback
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 from datetime import datetime
 from typing import List, Optional
 
@@ -32,14 +38,14 @@ suppress_subprocess_window()
 # ==== Logger Setup ====
 LOG_FILE = setup_logger("download_ndc_report.log")
 
-load_dotenv(verbose=True)
+load_dotenv()
 
 
 # ==== Application Configuration ====
 class AppConfig:
     """Manages environment variables, credentials, paths, and runtime settings."""
 
-    def __init__(self):
+    def __init__(self, from_date: Optional[str] = None, business_unit: Optional[str] = None):
         try:
             # Oracle Fusion credentials and URL
             self.oracle_url: str = (os.getenv("ORACLE_URL") or "").strip()
@@ -56,8 +62,16 @@ class AppConfig:
             self.start_maximized: bool = self._parse_bool(os.getenv("START_MAXIMIZED"), default=True)
 
             # Report parameters
-            self.business_unit_search: str = "Adani Green"
-            self.from_date_value: str = "02-09-2026"
+            self.business_unit_search: str = (
+                business_unit
+                or os.getenv("ORACLE_BUSINESS_UNIT", "").strip()
+                or "Adani Green"
+            )
+            self.from_date_value: str = (
+                from_date
+                or os.getenv("ORACLE_FROM_DATE", "").strip()
+                or datetime.now().strftime("%d-%m-%Y")
+            )
 
             # Ensure download directory exists
             self.download_dir.mkdir(parents=True, exist_ok=True)
@@ -775,11 +789,11 @@ class NDCOracleReportDownloader:
 
 
 # ==== Main Entry Point ====
-async def download_ndc_report():
+async def download_ndc_report(from_date: Optional[str] = None, business_unit: Optional[str] = None):
     """Main entrypoint function for NDC report downloader."""
-    app_config = AppConfig()
+    app_config = AppConfig(from_date=from_date, business_unit=business_unit)
     downloader = NDCOracleReportDownloader(app_config)
-    await downloader.download()
+    return await downloader.download()
 
 
 if __name__ == "__main__":

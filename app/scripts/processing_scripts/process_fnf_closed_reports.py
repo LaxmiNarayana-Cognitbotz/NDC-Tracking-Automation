@@ -36,7 +36,7 @@ download_module = importlib.import_module("app.scripts.automation_scripts.downlo
 download_ff_reports = download_module.download_ff_reports
 
 # Load environment variables
-load_dotenv(verbose=True)
+load_dotenv()
 
 # ==== Logging Setup ====
 LOG_FILE = setup_logger("process_fnf_closed_reports.log")

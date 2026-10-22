@@ -11,6 +11,12 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 import asyncio
+
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
 import glob
 import os
 import re
@@ -33,7 +39,7 @@ suppress_subprocess_window()
 # ==== Logger Setup ====
 LOG_FILE = setup_logger("download_ff_report.log")
 
-load_dotenv(verbose=True)
+load_dotenv()
 
 
 # ==== Result Status Constants ====

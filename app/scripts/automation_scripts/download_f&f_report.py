@@ -331,7 +331,7 @@ class ContentServerClient:
                     "adani.auth",
                 ]
             ):
-                await self.sso_handler.authenticate(page, timeout_s=120)
+                await self.sso_handler.authenticate(page, timeout_s=300)
 
             # Handle RSA / SecurID Rejection
             try:
@@ -1157,7 +1157,7 @@ class FFReportDownloader:
                 )
                 await first_page.wait_for_timeout(3000)
 
-                await self.client.wait_for_home(first_page, timeout_s=120)
+                await self.client.wait_for_home(first_page, timeout_s=300)
                 await first_page.wait_for_timeout(2000)
                 print(f"[{AutomationUtils.ts()}] Login confirmed. Preparing {concurrency} tab(s)...\n")
 

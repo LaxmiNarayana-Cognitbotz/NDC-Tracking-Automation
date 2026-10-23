@@ -46,10 +46,22 @@ class MicrosoftSSOHandler:
             print(f"[{self._ts()}]   Could not save screenshot: {e}")
             return ""
 
-    async def check_for_sso_errors(self, page: Page, check_password_error: bool = True):
+    async def check_for_sso_errors(
+        self,
+        page: Page,
+        check_password_error: Optional[bool] = None,
+        check_username_error: Optional[bool] = None,
+    ):
         """Checks if Microsoft SSO displays validation or security error messages."""
         try:
-            error_ids = ["usernameError", "error"]
+            if check_password_error is None:
+                check_password_error = self.password_filled
+            if check_username_error is None:
+                check_username_error = self.email_filled
+
+            error_ids = ["error"]
+            if check_username_error:
+                error_ids.append("usernameError")
             if check_password_error:
                 error_ids.append("passwordError")
 
@@ -59,6 +71,11 @@ class MicrosoftSSOHandler:
                     if await loc.count() > 0 and await loc.is_visible(timeout=500):
                         err_text = (await loc.inner_text()).strip().replace("\n", " ")
                         if err_text:
+                            # Skip harmless validation prompts if submission has not yet occurred
+                            if not check_password_error and "password" in err_text.lower():
+                                continue
+                            if not check_username_error and ("email" in err_text.lower() or "skype" in err_text.lower()):
+                                continue
                             raise RuntimeError(f"Microsoft SSO Error: {err_text}")
                 except RuntimeError:
                     raise
@@ -70,7 +87,12 @@ class MicrosoftSSOHandler:
                 if await alert_loc.count() > 0 and await alert_loc.is_visible(timeout=500):
                     text = (await alert_loc.inner_text()).strip().replace("\n", " ")
                     if text:
-                        raise RuntimeError(f"Microsoft SSO Alert: {text}")
+                        if not check_password_error and "password" in text.lower():
+                            pass
+                        elif not check_username_error and ("email" in text.lower() or "skype" in text.lower()):
+                            pass
+                        else:
+                            raise RuntimeError(f"Microsoft SSO Alert: {text}")
             except RuntimeError:
                 raise
             except Exception:
@@ -130,6 +152,18 @@ class MicrosoftSSOHandler:
             if any(x in current_url for x in ["securid.com", "adani.auth"]) or self.rsa_clicked:
                 return "RSA_WAIT"
 
+            # ==== Microsoft Authenticator Number Match Check ====
+            try:
+                auth_sign = page.locator(
+                    '#idRichContext_DisplaySign, div.displaySign, '
+                    '#loginHeader:has-text("Approve sign in request"), '
+                    'div[role="heading"]:has-text("Approve sign in request")'
+                ).first
+                if await auth_sign.count() > 0 and await auth_sign.is_visible(timeout=300):
+                    return "MFA_NUMBER"
+            except Exception:
+                pass
+
             # Reset email_filled if we are explicitly on the Sign In (email) screen
             try:
                 sign_in_header = page.locator(
@@ -140,32 +174,36 @@ class MicrosoftSSOHandler:
             except Exception:
                 pass
 
+            # ==== Account Picker Screen Check ====
+            try:
+                pick_header = page.locator(
+                    '#loginHeader:has-text("Pick an account"), '
+                    'div[role="heading"]:has-text("Pick an account"), '
+                    '#loginHeader:has-text("Choose an account"), '
+                    '#otherTile, div#otherTile, #tilesHolder'
+                ).first
+                pw_input_chk = page.locator('input[name="passwd"], input[type="password"]').first
+                if await pick_header.count() > 0 and await pick_header.is_visible(timeout=300):
+                    if not (await pw_input_chk.count() > 0 and await pw_input_chk.is_visible(timeout=200)):
+                        return "PICK_ACCOUNT"
+            except Exception:
+                pass
+
             # ==== Password Input Screen Check ====
             try:
+                pw_input = page.locator(
+                    'input[name="passwd"], input[id="i0118"], input[type="password"]'
+                ).first
                 pw_header = page.locator(
                     '#loginHeader:has-text("Enter password"), '
                     'div[role="heading"]:has-text("Enter password"), '
                     '#loginHeader:has-text("password"), '
-                    '#idBtn_Back, #displayName, #identityBanner, '
-                    '#idSIButton9[value="Sign in"], #idA_PWD_SwitchToCredPicker'
+                    '#idSIButton9[value="Sign in"]'
                 ).first
-                pw_input = page.locator(
-                    'input[name="passwd"], input[id="i0118"], input[type="password"]'
-                ).first
-                if (await pw_header.count() > 0 and await pw_header.is_visible(timeout=300)) or (
-                    self.email_filled and await pw_input.count() > 0 and await pw_input.is_visible(timeout=300)
-                ):
+                if await pw_input.count() > 0 and await pw_input.is_visible(timeout=300):
                     return "PASSWORD"
-            except Exception:
-                pass
-
-            # ==== Account Picker Screen Check ====
-            try:
-                pick_header = page.locator(
-                    '#loginHeader:has-text("Pick an account"), div[role="heading"]:has-text("Pick an account")'
-                ).first
-                if await pick_header.count() > 0 and await pick_header.is_visible(timeout=300):
-                    return "PICK_ACCOUNT"
+                if await pw_header.count() > 0 and await pw_header.is_visible(timeout=300):
+                    return "PASSWORD"
             except Exception:
                 pass
 
@@ -187,6 +225,7 @@ class MicrosoftSSOHandler:
         """Selects the target account tile if listed on account picker screen."""
         try:
             target_email = self.oracle_email.strip().lower()
+            target_user = target_email.split("@")[0] if "@" in target_email else target_email
             account_found = False
 
             account_selectors = [
@@ -202,7 +241,7 @@ class MicrosoftSSOHandler:
                     for i in range(count):
                         tile = accounts.nth(i)
                         tile_text = (await tile.inner_text()).strip().lower()
-                        if target_email in tile_text:
+                        if target_email in tile_text or (target_user and target_user in tile_text):
                             print(f"[{self._ts()}]   Selecting account: {self.oracle_email}")
                             await tile.click(force=True, timeout=5000)
                             account_found = True
@@ -247,6 +286,8 @@ class MicrosoftSSOHandler:
                             if await use_another.count() > 0 and await use_another.is_visible(timeout=1000):
                                 print(f"[{self._ts()}]   Clicking 'Use another account'...")
                                 await use_another.click(force=True, timeout=5000)
+                                self.email_filled = False
+                                self.password_filled = False
                                 break
                         except Exception:
                             continue
@@ -267,6 +308,11 @@ class MicrosoftSSOHandler:
                 for attempt in range(1, 4):
                     try:
                         await email_input.click(force=True, timeout=3000)
+                        try:
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Backspace")
+                        except Exception:
+                            pass
                         await email_input.fill("", force=True, timeout=3000)
                         await page.wait_for_timeout(200)
                         await email_input.type(self.oracle_email.strip(), delay=40)
@@ -277,7 +323,7 @@ class MicrosoftSSOHandler:
                         await next_btn.click(force=True, timeout=5000)
                         await page.wait_for_timeout(2500)
 
-                        await self.check_for_sso_errors(page, check_password_error=False)
+                        await self.check_for_sso_errors(page, check_password_error=False, check_username_error=True)
                         self.email_filled = True
                         break
                     except RuntimeError:
@@ -294,6 +340,7 @@ class MicrosoftSSOHandler:
         """Fills the password field and submits."""
         try:
             target_email = self.oracle_email.strip().lower()
+            target_user = target_email.split("@")[0] if "@" in target_email else target_email
 
             # Verify if the displayed account matches target Oracle email
             try:
@@ -314,7 +361,7 @@ class MicrosoftSSOHandler:
                             text = (await loc.inner_text()).strip().lower()
                             title = (await loc.get_attribute("title") or "").strip().lower()
                             for candidate in [text, title]:
-                                if "@" in candidate:
+                                if candidate and candidate != "enter password":
                                     current_account = candidate
                                     break
                             if current_account:
@@ -323,7 +370,11 @@ class MicrosoftSSOHandler:
                         continue
 
                 # If a different account is active on the password screen, click Back to switch
-                if current_account and target_email not in current_account:
+                is_target_account = (
+                    target_email in current_account
+                    or (target_user and target_user in current_account)
+                )
+                if current_account and not is_target_account:
                     print(
                         f"[{self._ts()}]   Previous session with different account detected ({current_account}) — switching to {self.oracle_email}"
                     )
@@ -336,6 +387,8 @@ class MicrosoftSSOHandler:
                         "button.backButton",
                         'button:has-text("Back")',
                         'div[role="button"][aria-label="Back"]',
+                        "#idA_PWD_SwitchToCredPicker",
+                        'a:has-text("Sign-in options")',
                     ]
                     for b_sel in back_btn_selectors:
                         try:
@@ -345,6 +398,7 @@ class MicrosoftSSOHandler:
                                 print(f"[{self._ts()}]   Clicked Back button to switch account")
                                 await page.wait_for_timeout(2000)
                                 self.email_filled = False
+                                self.password_filled = False
                                 return
                         except Exception:
                             continue
@@ -358,6 +412,11 @@ class MicrosoftSSOHandler:
                 for attempt in range(1, 4):
                     try:
                         await pw_input.click(force=True, timeout=3000)
+                        try:
+                            await page.keyboard.press("Control+A")
+                            await page.keyboard.press("Backspace")
+                        except Exception:
+                            pass
                         await pw_input.fill("", force=True, timeout=3000)
                         await page.wait_for_timeout(200)
                         await pw_input.type(self.oracle_password.strip(), delay=40)
@@ -368,8 +427,8 @@ class MicrosoftSSOHandler:
                         await signin_btn.click(force=True, timeout=5000)
                         await page.wait_for_timeout(2500)
 
-                        await self.check_for_sso_errors(page)
                         self.password_filled = True
+                        await self.check_for_sso_errors(page, check_password_error=True)
                         break
                     except RuntimeError:
                         if attempt == 3:
@@ -490,6 +549,20 @@ class MicrosoftSSOHandler:
                         ]
                     ):
                         return True
+
+                elif screen == "MFA_NUMBER":
+                    try:
+                        num_el = page.locator('#idRichContext_DisplaySign, div.displaySign').first
+                        num_val = ""
+                        if await num_el.count() > 0 and await num_el.is_visible(timeout=500):
+                            num_val = (await num_el.inner_text()).strip()
+                        if num_val:
+                            print(f"[{self._ts()}] [MFA] Microsoft Authenticator prompt: Enter number [{num_val}] on your Authenticator app.")
+                        else:
+                            print(f"[{self._ts()}] [MFA] Microsoft Authenticator prompt: Please approve the request on your Authenticator app.")
+                    except Exception:
+                        pass
+                    await page.wait_for_timeout(3000)
 
                 elif screen == "KMSI":
                     await self._handle_kmsi(page)

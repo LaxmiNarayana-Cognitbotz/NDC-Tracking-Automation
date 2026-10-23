@@ -410,7 +410,7 @@ class NDCOracleReportDownloader:
                         "adani.auth",
                     ]
                 ):
-                    await self.sso_handler.authenticate(page, timeout_s=120)
+                    await self.sso_handler.authenticate(page, timeout_s=300)
 
                 # Check if Oracle Home selector is visible
                 for sel in home_selectors:
@@ -631,7 +631,7 @@ class NDCOracleReportDownloader:
                 await page.goto(self.config.oracle_url, wait_until="domcontentloaded", timeout=90_000)
                 await page.wait_for_timeout(3000)
 
-                await self.wait_for_oracle_home(page, timeout_s=120)
+                await self.wait_for_oracle_home(page, timeout_s=300)
                 await page.wait_for_timeout(2000)
 
                 print(f"[{AutomationUtils.ts()}] Opening NDC Process Request Status report...")
